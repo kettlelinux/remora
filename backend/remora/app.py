@@ -68,12 +68,14 @@ class Remora:
             await self._runner.cleanup()
 
 
-async def run(cfg: Config) -> None:
+async def run(cfg: Config, show_token: bool = False) -> None:
     remora = Remora(cfg)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
     await remora.start()
+    if show_token:  # remora dev: for test clients that talk to the WebSocket themselves
+        log.info("WebSocket: ws://%s:%d/ws?auth=%s", cfg.host, cfg.port, remora.token)
     await stop.wait()
     await remora.stop()

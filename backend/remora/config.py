@@ -62,7 +62,10 @@ class Config:
     stop_timeout: float = 5.0
     version: str = __version__
     decky_version: str = DECKY_COMPAT_VERSION
+    # folders of plugins, or single plugin folders, loaded next to plugins/ (remora dev)
     extra_plugin_dirs: list[Path] = field(default_factory=list)
+    # live-reload every plugin on change, not only those with the "debug" flag (remora dev)
+    reload_all: bool = False
 
     @property
     def plugins_dir(self) -> Path:

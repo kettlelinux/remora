@@ -82,7 +82,9 @@ def open_beneath(base: str, rel_parts: list[str]) -> int:
             fd = nfd
         if not rel_parts:
             raise IsADirectoryError(base)
-        ffd = os.open(rel_parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+        # O_NONBLOCK: a fifo planted there would block open() (and the loader's event loop)
+        ffd = os.open(rel_parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                      dir_fd=fd)
     finally:
         os.close(fd)
     st = os.fstat(ffd)
