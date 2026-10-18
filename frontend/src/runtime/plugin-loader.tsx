@@ -30,8 +30,15 @@ import { Updates } from './updates';
 
 const log = logger('loader');
 const PLUGIN_BASE = 'http://127.0.0.1:1337/plugins/';
+/** Boot and resync imports: generous, but one hung plugin must not hold up the rest. */
+const BOOT_TIMEOUT_MS = 60_000;
+const EVENT_TIMEOUT_MS = 15_000;
 
 class TimeoutError extends Error {}
+
+interface ImportRequest extends QueuedImport {
+  gen: number;
+}
 
 export class PluginLoader {
   readonly plugins = new Store<LoadedPlugin[]>([]);
@@ -61,11 +68,30 @@ export class PluginLoader {
   private reloadLock = false;
   private offs: (() => void)[] = [];
   private stopped = false;
+  /**
+   * Per-name generation: every import request and every unload bumps it. An import whose
+   * generation is no longer current when its turn comes is skipped; one that finishes after it
+   * was superseded gets onDismount() instead of being added. So an unload or disable that
+   * arrives while an import is in flight wins, and the newest of two imports wins.
+   */
+  private gens = new Map<string, number>();
+  /** Per-name chain: imports of one name run one after the other, never interleaved. */
+  private chains = new Map<string, Promise<void>>();
+  /** Import requests not finished yet, by name (for the reconnect resync). */
+  private requested = new Map<string, { gen: number; version?: string }>();
+  private bootLoad?: Promise<void>;
+  private resyncing = false;
+  private resyncAgain = false;
+  private installedSeq = 0;
+  private spRestarting = false;
 
   constructor(readonly backend: Backend) {
     this.settings = new Settings(backend);
     this.status = new StatusStore(backend);
-    this.installs = new InstallFlow(backend, this.toaster, () => void this.refreshInstalled().then(() => this.updates.check()));
+    this.installs = new InstallFlow(backend, this.toaster, () => {
+      void this.refreshInstalled().then(() => this.updates.check());
+      void this.settings.load();
+    });
     this.updates = new Updates(backend, this.settings, (name) => this.installed.get().find((p) => p.name === name)?.version);
     this.api = new PluginApiHost({ backend, routerHook: this.routerHook, toaster: this.toaster });
   }
@@ -90,10 +116,14 @@ export class PluginLoader {
     window.__DECKY_SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED_deckyLoaderAPIInit = this.api;
 
     await Promise.allSettled([this.settings.load(), this.status.refresh()]);
-    await this.loadPlugins();
-    const spAfterLoad = currentSP();
-    setTimeout(() => this.checkSP(spAfterLoad), 5000);
+    // Neither the update timers nor the SP check wait for plugin imports.
     this.updates.start();
+    const bootLoad = (this.bootLoad = this.loadPlugins().catch((e) => log.error('loading plugins failed', e)));
+    void Promise.race([bootLoad, sleep(BOOT_TIMEOUT_MS + 5000)]).then(() => {
+      const sp = currentSP();
+      setTimeout(() => void this.checkSP(sp), 5000);
+    });
+    await bootLoad;
   }
 
   private listen(): void {
@@ -101,14 +131,15 @@ export class PluginLoader {
       this.backend.addEventListener(event, fn);
       this.offs.push(() => this.backend.removeEventListener(event, fn));
     };
-    on('loader/import_plugin', (name, version, loadType, useQueue = true, timeoutMs = 15000) =>
-      this.importPlugin(String(name), version as string | undefined, Number(loadType), useQueue !== false, Number(timeoutMs) || 15000)
+    on('loader/import_plugin', (name, version, loadType, useQueue = true, timeoutMs = EVENT_TIMEOUT_MS) =>
+      this.importPlugin(String(name), version as string | undefined, Number(loadType), useQueue !== false, Number(timeoutMs) || EVENT_TIMEOUT_MS)
         .catch((e) => log.error(`import of ${String(name)} failed`, e))
         .finally(() => void this.refreshInstalled()),
     );
     on('loader/unload_plugin', (name) => {
       this.unloadPlugin(String(name));
       void this.refreshInstalled();
+      void this.settings.load();
     });
     on('loader/disable_plugin', (name) => {
       this.unloadPlugin(String(name));
@@ -125,6 +156,13 @@ export class PluginLoader {
         }
       }),
     );
+    // Events sent while the socket was down are lost: after every reconnect, re-read the state.
+    const baseline = Math.max(this.backend.opens.get(), 1);
+    this.offs.push(
+      this.backend.opens.subscribe((n) => {
+        if (n > baseline) void this.resync();
+      }),
+    );
     this.installs.listen();
   }
 
@@ -132,7 +170,7 @@ export class PluginLoader {
     const mode = await firstUIMode();
     if (mode === EUIMode.GamePad) await waitForSP();
     let list: InstalledPlugin[] | undefined;
-    for (let attempt = 0; attempt < 5 && !list; attempt++) {
+    for (let attempt = 0; attempt < 5 && !list && !this.stopped; attempt++) {
       try {
         list = await this.backend.call<InstalledPlugin[]>('loader/get_plugins');
       } catch (e) {
@@ -140,74 +178,199 @@ export class PluginLoader {
         await sleep(2000);
       }
     }
-    if (!list) return;
+    if (!list || this.stopped) return;
     this.installed.set(list);
-    await Promise.allSettled(list.filter((p) => !p.disabled).map((p) => this.importPlugin(p.name, p.version, p.load_type, false)));
+    await Promise.allSettled(list.filter((p) => !p.disabled).map((p) => this.importPlugin(p.name, p.version, p.load_type, false, BOOT_TIMEOUT_MS)));
     log.info(`${this.plugins.get().length} plugin(s) loaded`);
   }
 
-  /** Re-reads loader/get_plugins (after install, uninstall, enable). */
+  /** Re-reads loader/get_plugins (after install, uninstall, enable). The newest answer wins. */
   async refreshInstalled(): Promise<void> {
+    const seq = ++this.installedSeq;
     try {
-      this.installed.set(await this.backend.call<InstalledPlugin[]>('loader/get_plugins'));
+      const list = await this.backend.call<InstalledPlugin[]>('loader/get_plugins');
+      if (seq === this.installedSeq) this.installed.set(list);
     } catch (e) {
       log.warn('loader/get_plugins failed', e);
     }
   }
 
+  /** After a reconnect: refresh state, then import missing, reload changed, unload removed plugins. */
+  private async resync(): Promise<void> {
+    if (this.stopped) return;
+    if (this.resyncing) {
+      this.resyncAgain = true;
+      return;
+    }
+    this.resyncing = true;
+    try {
+      await this.bootLoad; // diff against a finished boot, not a half-loaded one
+      do {
+        this.resyncAgain = false;
+        await Promise.allSettled([this.status.refresh(), this.settings.load()]);
+        let list: InstalledPlugin[];
+        try {
+          list = await this.backend.call<InstalledPlugin[]>('loader/get_plugins');
+        } catch (e) {
+          log.warn('resync: loader/get_plugins failed', e);
+          return;
+        }
+        if (this.stopped) return;
+        this.installedSeq++;
+        this.installed.set(list);
+        this.applyDiff(list);
+      } while (this.resyncAgain && !this.stopped);
+    } finally {
+      this.resyncing = false;
+    }
+  }
+
+  private applyDiff(list: InstalledPlugin[]): void {
+    const want = new Map(list.filter((p) => !p.disabled).map((p) => [p.name, p]));
+    const known = new Set([...this.plugins.get().map((p) => p.name), ...this.requested.keys()]);
+    for (const name of known) {
+      if (want.has(name)) continue;
+      log.info(`resync: unloading ${name}`);
+      this.unloadPlugin(name);
+    }
+    for (const p of want.values()) {
+      const req = this.requested.get(p.name);
+      const loaded = this.plugins.get().find((x) => x.name === p.name);
+      if (req ? req.version === p.version : loaded && loaded.version === p.version && !loaded.loadError) continue;
+      log.info(`resync: ${loaded || req ? 'reloading' : 'importing'} ${p.name} ${p.version ?? ''}`);
+      void this.importPlugin(p.name, p.version, p.load_type, false, BOOT_TIMEOUT_MS).catch((e) => log.error(`resync import of ${p.name} failed`, e));
+    }
+  }
+
+  private bump(name: string): number {
+    const gen = (this.gens.get(name) ?? 0) + 1;
+    this.gens.set(name, gen);
+    return gen;
+  }
+
+  private isCurrent(name: string, gen: number): boolean {
+    return !this.stopped && this.gens.get(name) === gen;
+  }
+
   async importPlugin(name: string, version: string | undefined, loadType: number, useQueue = true, timeoutMs?: number): Promise<void> {
     if (this.stopped) return;
+    const gen = this.bump(name);
+    this.requested.set(name, { gen, version });
+    return this.runImport({ name, version, loadType, timeoutMs, gen }, useQueue);
+  }
+
+  private async runImport(req: ImportRequest, useQueue: boolean): Promise<void> {
     if (useQueue && this.reloadLock) {
-      this.pluginReloadQueue.push({ name, version, loadType, timeoutMs });
+      this.pluginReloadQueue.push(req);
       return;
     }
     if (useQueue) this.reloadLock = true;
     try {
-      await this.doImport(name, version, loadType, timeoutMs);
+      await this.serialImport(req);
     } finally {
       if (useQueue) {
         this.reloadLock = false;
         const next = this.pluginReloadQueue.shift();
-        if (next) void this.importPlugin(next.name, next.version, next.loadType, true, next.timeoutMs).catch((e) => log.error(`queued import of ${next.name} failed`, e));
+        if (next) {
+          // entries pushed by someone else carry no generation: they count as a new request
+          const queued: ImportRequest = typeof (next as Partial<ImportRequest>).gen === 'number' ? (next as ImportRequest) : { ...next, gen: this.bump(next.name) };
+          void this.runImport(queued, true).catch((e) => log.error(`queued import of ${next.name} failed`, e));
+        }
       }
     }
   }
 
-  private async doImport(name: string, version: string | undefined, loadType: number, timeoutMs?: number): Promise<void> {
-    this.unloadPlugin(name);
+  private serialImport(req: ImportRequest): Promise<void> {
+    const prev = this.chains.get(req.name) ?? Promise.resolve();
+    const run = prev.then(() => this.doImport(req));
+    const tail = run.catch(() => {});
+    this.chains.set(req.name, tail);
+    void tail.then(() => {
+      if (this.chains.get(req.name) === tail) this.chains.delete(req.name);
+      const r = this.requested.get(req.name);
+      if (r?.gen === req.gen) this.requested.delete(req.name);
+    });
+    return run;
+  }
+
+  private async doImport(req: ImportRequest): Promise<void> {
+    const { name, version, loadType, timeoutMs, gen } = req;
+    if (!this.isCurrent(name, gen)) {
+      log.debug(`${name}: import superseded before it started`);
+      return;
+    }
+    this.removeLoaded(name);
     const spBefore = currentSP();
     const started = performance.now();
+    let loading: Promise<PluginDefinition> | undefined;
     try {
-      const def = loadType === LOAD_ESM ? await this.importESM(name, timeoutMs) : await this.importLegacy(name, timeoutMs);
+      let def: PluginDefinition;
+      if (loadType === LOAD_ESM) {
+        loading = this.importESM(name);
+        def = timeoutMs ? await withTimeout(loading, timeoutMs, `import timed out after ${timeoutMs} ms`).catch(rethrowTimeout) : await loading;
+      } else {
+        def = await this.importLegacy(name, timeoutMs);
+      }
       if (!def || typeof def !== 'object') throw new Error('the plugin factory returned no plugin object');
-      this.add({ ...def, name, version, loadType });
-      log.info(`loaded ${name} ${version ?? ''} in ${Math.round(performance.now() - started)} ms`);
+      if (this.settle(req, def)) log.info(`loaded ${name} ${version ?? ''} in ${Math.round(performance.now() - started)} ms`);
     } catch (e) {
       if (e instanceof TimeoutError) {
+        // A late import still has to end up somewhere: shown if nothing replaced it, else dismounted.
+        loading?.then(
+          (def) => {
+            if (!def || typeof def !== 'object') return;
+            if (this.settle(req, def)) log.warn(`${name} finished loading after its timeout`);
+          },
+          () => {},
+        );
+      }
+      if (!this.isCurrent(name, gen)) {
+        log.info(`${name}: a superseded import failed`, e);
+        return;
+      }
+      if (e instanceof TimeoutError) {
+        // The contract re-throws and adds nothing; Remora also shows why the plugin is missing.
         log.error(`${name}: ${e.message}`);
+        this.addLoadError(req, e, t('plugin.loadTimeout', { seconds: Math.round((timeoutMs ?? 0) / 1000) }));
         throw e;
       }
       log.error(`failed to load ${name}`, e);
-      this.add({
-        name,
-        version,
-        loadType,
-        icon: <WarningIcon />,
-        content: <PluginLoadError name={name} error={e} />,
-        loadError: { message: errorText(e), stack: errorStack(e) },
-      });
-      this.toaster.toast({ title: t('plugin.loadFailed', { name }), body: errorText(e) || t('plugin.loadFailedBody'), logo: <WarningIcon /> });
+      this.addLoadError(req, e, errorText(e) || t('plugin.loadFailedBody'));
     } finally {
-      this.checkSP(spBefore);
+      void this.checkSP(spBefore);
     }
   }
 
-  private async importESM(name: string, timeoutMs?: number): Promise<PluginDefinition> {
+  /** Adds the plugin if its import is still the current one, else dismounts it. True if added. */
+  private settle(req: ImportRequest, def: PluginDefinition): boolean {
+    if (!this.isCurrent(req.name, req.gen)) {
+      log.info(`${req.name}: import was superseded; dismounting its result`);
+      safeDismount(req.name, def);
+      return false;
+    }
+    this.add({ ...def, name: req.name, version: req.version, loadType: req.loadType });
+    return true;
+  }
+
+  private addLoadError(req: ImportRequest, e: unknown, toastBody: string): void {
+    const { name, version, loadType } = req;
+    this.add({
+      name,
+      version,
+      loadType,
+      icon: <WarningIcon />,
+      content: <PluginLoadError name={name} error={e} />,
+      loadError: { message: errorText(e), stack: errorStack(e) },
+    });
+    this.toaster.toast({ title: t('plugin.loadFailed', { name }), body: toastBody, logo: <WarningIcon /> });
+  }
+
+  private importESM(name: string): Promise<PluginDefinition> {
     const url = `${PLUGIN_BASE}${name}/dist/index.js?t=${Date.now()}`;
-    const p = import(/* webpackIgnore: true */ url) as Promise<{ default?: unknown }>;
-    const mod = timeoutMs ? await withTimeout(p, timeoutMs, `import timed out after ${timeoutMs} ms`).catch(rethrowTimeout) : await p;
-    if (typeof mod.default !== 'function') throw new Error('dist/index.js has no default export function');
-    return (await (mod.default as () => unknown)()) as PluginDefinition;
+    return (import(/* webpackIgnore: true */ url) as Promise<{ default?: unknown }>).then(async (mod) => {
+      if (typeof mod.default !== 'function') throw new Error('dist/index.js has no default export function');
+      return (await (mod.default as () => unknown)()) as PluginDefinition;
+    });
   }
 
   private async importLegacy(name: string, timeoutMs?: number): Promise<PluginDefinition> {
@@ -239,24 +402,35 @@ export class PluginLoader {
     this.plugins.update((all) => [...all.filter((p) => p.name !== plugin.name), plugin]);
   }
 
+  /** Unloads `name` and cancels any import of it that is still in flight. */
   unloadPlugin(name: string): void {
+    this.bump(name);
+    this.requested.delete(name);
+    this.removeLoaded(name);
+  }
+
+  private removeLoaded(name: string): void {
     const p = this.plugins.get().find((x) => x.name === name);
     if (!p) return;
-    try {
-      p.onDismount?.();
-    } catch (e) {
-      log.error(`${name}: onDismount failed`, e);
-    }
-    this.api.forget(name);
+    safeDismount(name, p);
+    // Keep the plugin's listener map registered (a reload whose @decky/api module is cached
+    // never calls connect() again); connect() replaces it when it does run.
+    this.api.clearListeners(name);
     this.plugins.update((all) => all.filter((x) => x !== p));
   }
 
   /** Steam's SP window vanishing right after a plugin loaded means the plugin crashed it. */
-  private checkSP(before: Window | undefined): void {
-    if (before && !currentSP()) {
-      log.error('the Game Mode window disappeared; restarting the Steam web helper');
-      void this.backend.call('utilities/restart_webhelper').catch(() => {});
+  private async checkSP(before: Window | undefined): Promise<void> {
+    if (!before || currentSP() || this.spRestarting) return;
+    // One negative lookup is not enough (the window can be mid-reload): look again over ~2 s.
+    for (let i = 0; i < 3; i++) {
+      await sleep(700);
+      if (this.stopped || currentSP()) return;
     }
+    if (this.spRestarting) return;
+    this.spRestarting = true;
+    log.error('the Game Mode window disappeared; restarting the Steam web helper');
+    void this.backend.call('utilities/restart_webhelper').catch(() => {});
   }
 
   async reloadPlugin(name: string): Promise<void> {
@@ -264,13 +438,9 @@ export class PluginLoader {
   }
 
   dismountAll(): void {
-    for (const p of this.plugins.get()) {
-      try {
-        p.onDismount?.();
-      } catch (e) {
-        log.error(`${p.name}: onDismount failed`, e);
-      }
-    }
+    for (const name of new Set([...this.plugins.get().map((p) => p.name), ...this.requested.keys()])) this.bump(name);
+    this.requested.clear();
+    for (const p of this.plugins.get()) safeDismount(p.name, p);
     this.plugins.set([]);
   }
 
@@ -287,6 +457,14 @@ export class PluginLoader {
         log.warn('hook deinit failed', e);
       }
     }
+  }
+}
+
+function safeDismount(name: string, def: PluginDefinition): void {
+  try {
+    def.onDismount?.();
+  } catch (e) {
+    log.error(`${name}: onDismount failed`, e);
   }
 }
 

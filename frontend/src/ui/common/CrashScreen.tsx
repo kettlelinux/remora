@@ -11,10 +11,31 @@ const backendCall = (route: string, ...args: unknown[]) => {
   void window.DeckyBackend?.call(route, ...args).catch((e) => console.error('[Remora]', route, e));
 };
 
+/** Steam's DialogButton takes autoFocus; @decky/ui's types only know preferredFocus. */
+const focusFirst = { preferredFocus: true, ...({ autoFocus: true } as object) };
+
 const pre = { whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 12, maxHeight: '40vh', overflowY: 'auto', background: 'rgba(0,0,0,0.3)', padding: 8, borderRadius: 4 } as const;
 
 export function CrashScreen({ error, reset }: { error: unknown; reset: () => void }) {
   const [details, setDetails] = useState(false);
+  const [busy, setBusy] = useState(false);
+  // Reset only once the plugin is really gone: resetting first re-renders the crashing tree.
+  const removeThenReset = (route: string, name: string) => async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await window.DeckyBackend?.call(route, name);
+    } catch (e) {
+      console.error('[Remora]', route, e);
+    }
+    try {
+      window.DeckyPluginLoader?.unloadPlugin(name);
+    } catch (e) {
+      console.error('[Remora] unload failed', e);
+    }
+    setBusy(false);
+    reset();
+  };
   const stack = errorStack(error);
   const src = attribute(stack);
   const blame = src.kind === 'plugin' ? t('crash.likelyPlugin', { name: src.name }) : src.kind === 'loader' ? t('crash.likelyRemora') : t('crash.unknown');
@@ -27,15 +48,15 @@ export function CrashScreen({ error, reset }: { error: unknown; reset: () => voi
       <p>{t('crash.likely', { source: blame })}</p>
       <p style={{ fontFamily: 'monospace' }}>{errorText(error)}</p>
       <Focusable style={{ display: 'flex', flexDirection: 'column', maxWidth: 480 }} flow-children="vertical">
-        <DialogButton style={btn} onClick={reset}>
+        <DialogButton style={btn} onClick={reset} {...focusFirst}>
           {t('common.retry')}
         </DialogButton>
         {src.kind === 'plugin' && (
           <>
-            <DialogButton style={btn} onClick={() => (backendCall('utilities/disable_plugin', src.name), reset())}>
+            <DialogButton style={btn} disabled={busy} onClick={() => void removeThenReset('utilities/disable_plugin', src.name)()}>
               {t('crash.disablePlugin', { name: src.name })}
             </DialogButton>
-            <DialogButton style={btn} onClick={() => (backendCall('utilities/uninstall_plugin', src.name), reset())}>
+            <DialogButton style={btn} disabled={busy} onClick={() => void removeThenReset('utilities/uninstall_plugin', src.name)()}>
               {t('crash.uninstallPlugin', { name: src.name })}
             </DialogButton>
           </>
@@ -67,7 +88,7 @@ export function PluginCrashCard({ error, plugin, retry }: { error: unknown; plug
       </div>
       <div style={{ fontSize: 12, margin: '6px 0', opacity: 0.8 }}>{errorText(error)}</div>
       <Focusable style={{ display: 'flex', gap: 8 }} flow-children="horizontal">
-        <DialogButton style={{ minWidth: 0 }} onClick={retry}>
+        <DialogButton style={{ minWidth: 0 }} onClick={retry} {...focusFirst}>
           {t('common.retry')}
         </DialogButton>
         <DialogButton style={{ minWidth: 0 }} onClick={() => setDetails(!details)}>

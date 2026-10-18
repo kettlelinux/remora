@@ -37,6 +37,7 @@ function showingError(self: SteamAny): boolean {
 export class ErrorBoundaryHook {
   private patch?: Patch;
   private proto?: SteamAny;
+  private stopped = false;
 
   constructor() {
     window.__ERRORBOUNDARY_HOOK_INSTANCE?.deinit?.();
@@ -52,7 +53,10 @@ export class ErrorBoundaryHook {
     try {
       const proto = EB.prototype;
       this.proto = proto;
+      const self = this;
       this.patch = replacePatch(proto, 'render', function (this: SteamAny) {
+        // a newer instance patched on top of this one may still call through it after deinit
+        if (self.stopped) return callOriginal;
         if (showingError(this)) {
           if (this.props?.fallback !== undefined) return callOriginal;
           const err = this.state.error;
@@ -60,7 +64,7 @@ export class ErrorBoundaryHook {
         }
         if (this._remoraKey) {
           // Remount the children once with a new key, so a patched component type takes effect.
-          return <Fragment key={`remora-${this._remoraKey}`}>{this.__remoraOriginalRender()}</Fragment>;
+          return <Fragment key={`remora-${this._remoraKey}`}>{self.patch?.original.call(this)}</Fragment>;
         }
         return callOriginal;
       });
@@ -79,6 +83,7 @@ export class ErrorBoundaryHook {
   }
 
   deinit(): void {
+    this.stopped = true;
     try {
       this.patch?.unpatch();
     } catch (e) {

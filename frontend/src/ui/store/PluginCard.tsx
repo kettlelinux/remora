@@ -12,7 +12,8 @@ export interface StoreVersion {
   hash: string;
   artifact?: string | null;
   created?: string;
-  signed?: boolean | 'invalid';
+  /** 'self': signed with keys the index itself lists (unverified): shown like unsigned. */
+  signed?: boolean | 'invalid' | 'self';
   compatible?: boolean;
   incompatible_reason?: string;
 }
@@ -86,6 +87,7 @@ export function PluginCard({ plugin, sourceName, installed, backend, developer }
           </div>
         )}
         {version?.signed === true && <div style={{ fontSize: 12, color: '#59bf40' }}>{t('store.signed')}</div>}
+        {version?.signed === 'self' && <div style={{ fontSize: 12, opacity: 0.7 }}>{t('store.selfSigned')}</div>}
         {blocked && <div style={{ fontSize: 12, color: '#e5a50a' }}>{blocked}</div>}
         <Focusable style={{ display: 'flex', gap: 8, marginTop: 8 }} flow-children="horizontal">
           <DialogButton style={{ flex: 1, minWidth: 0 }} disabled={Boolean(blocked)} onClick={() => void install()}>

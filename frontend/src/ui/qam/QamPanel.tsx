@@ -8,7 +8,7 @@ import { qamPlugins } from '../../runtime/ordering';
 import type { LoadedPlugin } from '../../runtime/plugin';
 import type { PluginLoader } from '../../runtime/plugin-loader';
 import { useEffect, useRef } from 'react';
-import { activePlugin, qamVisible, reportQamDocumentVisible } from '../../runtime/qam-state';
+import { activePlugin, qamVisible, registerQamPanel } from '../../runtime/qam-state';
 import { statusBadges } from '../common/badges';
 import { PendingPrompts } from '../common/PendingPrompts';
 import { TitleBar } from '../common/TitleBar';
@@ -24,10 +24,14 @@ export function QamPanel({ loader }: { loader: PluginLoader }) {
     // the panel is rendered into the QAM window, whose document is hidden while the QAM is closed
     const doc = ref.current?.ownerDocument;
     if (!doc) return;
-    const update = () => reportQamDocumentVisible(doc.visibilityState === 'visible');
+    const panel = registerQamPanel();
+    const update = () => panel.report(doc.visibilityState === 'visible');
     update();
     doc.addEventListener('visibilitychange', update);
-    return () => doc.removeEventListener('visibilitychange', update);
+    return () => {
+      doc.removeEventListener('visibilitychange', update);
+      panel.dispose();
+    };
   }, []);
   return (
     <QuickAccessVisibleContext.Provider value={visible}>
@@ -76,7 +80,7 @@ function PluginList({ loader }: { loader: PluginLoader }) {
   const installed = useStore(loader.installed);
   const hooks = useStore(hookStatuses);
   const connected = useStore(loader.backend.connected);
-  const { shown, hidden } = qamPlugins(plugins, settings);
+  const { shown, hidden } = qamPlugins(plugins, settings, installed);
   const disabled = installed.filter((p) => p.disabled).length;
   // error-reporting only keeps plugin errors out of Valve's reports; nothing visible breaks
   const broken = hooks.some((h) => h.state === 'failed' && h.id !== 'error-reporting');

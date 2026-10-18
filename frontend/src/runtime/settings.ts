@@ -1,5 +1,7 @@
 // loader.json settings through utilities/settings/get|set. Keys Decky uses keep their names so a
-// Decky install's ordering, hidden and frozen lists carry over.
+// Decky install's ordering, hidden and frozen lists carry over. Remora's own `remora.*` keys and
+// developer.enabled are written through remora/settings/set (utilities/settings/set refuses them; the backend keeps an
+// allowlist of the harmless ones).
 import { logger } from '../util/logger';
 import { Store } from '../util/store';
 import type { Backend } from './backend';
@@ -47,11 +49,14 @@ export class Settings {
   }
 
   async set<K extends keyof LoaderSettings>(key: K, value: LoaderSettings[K]): Promise<void> {
+    const before = this.values.get()[key];
     this.values.update((v) => ({ ...v, [key]: value }));
     try {
-      await this.backend.call('utilities/settings/set', key, value);
+      await this.backend.call(key.startsWith('remora.') || key === 'developer.enabled' ? 'remora/settings/set' : 'utilities/settings/set', key, value);
     } catch (e) {
       log.error(`could not save ${key}`, e);
+      // show what is really stored, unless something else changed the key meanwhile
+      if (Object.is(this.values.get()[key], value)) this.values.update((v) => ({ ...v, [key]: before }));
     }
   }
 
