@@ -1,6 +1,7 @@
 // Lookup 9: Valve's error reporting store. Errors from plugins or Remora are kept out of Valve's
 // crash reports, and reporting pauses for 30 s after one (follow-on errors are usually ours too).
 import { callOriginal, findModuleExport, Patch, replacePatch } from '@decky/ui';
+import { modulesWithSource } from '../boot/webpack';
 import { SteamAny } from '../steam/globals';
 import { attribute, collectText } from '../util/errors';
 import { HookHandle, runStrategies } from './status';
@@ -20,6 +21,21 @@ export class ErrorReportFilter {
         find: () => {
           const inst = findModuleExport((e: SteamAny) => e && typeof e === 'object' && typeof e.BIsBlacklisted === 'function');
           return inst ? Object.getPrototypeOf(inst) : undefined;
+        },
+      },
+      {
+        // current Steam: the module exports only a lazy getter, `() => (r || (r = new C), r)`.
+        // Only that module's zero-argument exports are called, so nothing else gets constructed.
+        name: 'getter in the module defining BIsBlacklisted',
+        find: () => {
+          for (const mod of modulesWithSource('BIsBlacklisted(')) {
+            for (const exp of Object.values<SteamAny>(mod)) {
+              if (typeof exp !== 'function' || exp.length !== 0 || exp.prototype) continue;
+              const inst = exp();
+              if (inst && typeof inst.BIsBlacklisted === 'function') return Object.getPrototypeOf(inst);
+            }
+          }
+          return undefined;
         },
       },
     ], false);
