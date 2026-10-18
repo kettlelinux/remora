@@ -3,9 +3,10 @@
 #
 #   sudo bash uninstall.sh [--user NAME] [--prefix DIR] [--purge-config]
 #
-# ~/homebrew/plugins, settings, data and logs stay as they are, so Decky (or a later Remora)
-# finds the same plugins and settings. Keys Remora added to loader.json ("remora.*") stay too;
-# Decky ignores them. Running it twice is harmless.
+# Plugins and loader.json move back from Remora's root-owned folder (PRIVILEGED_PATH in
+# /etc/remora/remora.env) to ~/homebrew, so Decky (or a later Remora) finds the same plugins and
+# settings; each plugin's settings, data and logs never left ~/homebrew. Keys Remora added to
+# loader.json ("remora.*") stay; Decky ignores them. Running it twice is harmless.
 set -euo pipefail
 
 user='' prefix='' purge=0
@@ -14,7 +15,7 @@ while [ $# -gt 0 ]; do
     --user) user=$2; shift 2 ;;
     --prefix) prefix=$2; shift 2 ;;
     --purge-config) purge=1; shift ;;
-    -h|--help) sed -n '2,8s/^# \{0,1\}//p' "$0"; echo "  --purge-config  also remove /etc/remora (remora.env, the kept Decky unit)"; exit 0 ;;
+    -h|--help) sed -n '2,9s/^# \{0,1\}//p' "$0"; echo "  --purge-config  also remove /etc/remora (remora.env, the kept Decky unit)"; exit 0 ;;
     *) echo "uninstall.sh: unknown option $1" >&2; exit 2 ;;
   esac
 done
@@ -46,9 +47,28 @@ if ours "$unit"; then
   rm -f "$unit"
 fi
 
+priv=''
+if [ -f "$conf/remora.env" ]; then
+  priv=$(sed -n 's/^PRIVILEGED_PATH=//p' "$conf/remora.env" | tail -n1)
+fi
+if [ -n "$priv" ] && [ "$priv" != "$hb" ] && [ -d "$priv/plugins" ]; then
+  if [ -f "$prefix/move-plugins.py" ]; then
+    say "moving plugins and loader.json back to $hb"
+    /usr/bin/python3 -I "$prefix/move-plugins.py" out "$home" "$priv" \
+      || say "warning: some plugins stay in $priv/plugins"
+    rmdir "$priv/plugins" "$priv/settings" "$priv" 2>/dev/null || :
+  else
+    say "plugins stay in $priv/plugins (no move-plugins.py in $prefix to move them back)"
+  fi
+fi
+
 if [ -e "$prefix" ]; then
   if [ -f "$prefix/VERSION" ] && [ -f "$prefix/remora-start" ]; then
     rm -rf "$prefix"
+    if command -v semanage >/dev/null && command -v selinuxenabled >/dev/null && selinuxenabled 2>/dev/null; then
+      # shellcheck disable=SC2016  # a sed expression, not shell
+      semanage fcontext -d "$(printf '%s' "$(realpath -m -- "$prefix")" | sed 's/[][\.*^$()+?{}|]/\\&/g')(/.*)?" 2>/dev/null || :
+    fi
     say "removed $prefix"
   else
     say "$prefix doesn't look like a Remora install; left it alone"

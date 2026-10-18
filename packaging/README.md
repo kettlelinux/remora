@@ -12,13 +12,14 @@ Remora replaces Decky Loader in place. Whatever installs it must keep Decky's dr
 
 | File | What |
 |---|---|
-| `systemd/plugin_loader.service` | the unit: root, `Type=simple`, `Restart=always`, `KillMode=mixed`, `TimeoutStopSec=15`, runs `remora-start` |
+| `systemd/plugin_loader.service` | the unit: root, `Type=simple`, `Restart=always` every 2 s with no start limit, `KillMode=mixed`, `TimeoutStopSec=15`, runs `remora-start` |
 | `remora-start` | the start script: finds the Game Mode user, makes its folders as that user, sets the CEF flag, runs `python3 -P -m remora serve` |
 | `remora.env` | an example `/etc/remora/remora.env`, the settings `remora-start` reads |
 | `requirements.txt` | the backend's dependencies, pinned with hashes (`uv pip compile backend/pyproject.toml --generate-hashes --universal`) |
 | `arch/PKGBUILD` | an Arch package that installs into `/usr/lib/remora` |
 | `steamos/install.sh`, `uninstall.sh` | install on SteamOS or Bazzite in place of Decky, and back |
 | `steamos/make-tarball.sh` | builds the release tarball `install.sh` unpacks |
+| `steamos/move-plugins.py` | moves `plugins/` and `loader.json` between `~/homebrew` and the root-owned data folder, as root, by fd, without following links |
 
 Kettle Linux's own package lives in the kettlelinux repository (`packages/remora`), not here.
 
@@ -49,7 +50,9 @@ folder (Kettle uses `/home/.kettle/decky`) and migrate `~/homebrew/plugins` ther
 - `/usr/lib/remora/`: the `remora` package plus its dependencies from `requirements.txt`, as
   pure-Python wheels (hash-checked), so the package is `arch=any` and doesn't depend on the
   distro's `python-aiohttp`. Plugins import `aiohttp`, `certifi`, `watchdog` and
-  `async_timeout` from there.
+  `async_timeout` from there. `cryptography` (compiled) comes from the distro's
+  `python-cryptography`, which `python3 -P` still finds in the system site-packages; store sources
+  with pinned signing keys need it and are refused without it.
 - `/usr/lib/remora/remora-start`, `/usr/lib/systemd/system/plugin_loader.service`,
   `/etc/remora/remora.env`, and `/usr/bin/remora` for `remora call` and `remora dev`
 
@@ -74,21 +77,32 @@ sudo bash uninstall.sh                      # Decky's service back, plugins unto
 2. checks the release imports on the system Python (3.11+)
 3. stops `plugin_loader.service`, disables it if it is Decky's, and keeps Decky's unit file as
    `/etc/remora/plugin_loader.service.decky` (once; a reinstall doesn't overwrite it)
-4. unpacks to `/home/.remora` (`--prefix` to change), owned by root, swapped in
-   with a rename so a failed install leaves the old one; on SELinux (Bazzite) labels it `bin_t`
-5. writes `/etc/remora/remora.env` if missing, installs Remora's unit as
-   `/etc/systemd/system/plugin_loader.service` pointing at the new `remora-start`, enables it and
-   (re)starts it
+   Before that it refuses a `--prefix` or `--data` unless every existing folder on the way is
+   root's and not writable by group or others, makes the missing ones as root, and stages and
+   checks the new copy next to the prefix, so nothing running is touched until it is ready.
+4. swaps the staged copy into `/home/.remora` (`--prefix` to change) with a rename; on SELinux
+   (Bazzite) labels it `bin_t` with `semanage fcontext` + `restorecon` (`chcon` without semanage)
+5. writes `/etc/remora/remora.env` if missing, with `PRIVILEGED_PATH=/home/.remora-data`
+   (`--data`), and moves `~/homebrew/plugins/*` and `~/homebrew/settings/loader.json` there
+   (`move-plugins.py`: real folders become root's; links and stray files stay behind). The user
+   can then no longer add a plugin that runs as root by writing files. An env file an older
+   `install.sh` wrote with `PRIVILEGED_PATH=~/homebrew` is switched over the same way.
+6. installs Remora's unit as `/etc/systemd/system/plugin_loader.service` pointing at the new
+   `remora-start`, enables it and (re)starts it. If anything fails after Decky was stopped, or
+   Remora isn't running 3 s after the start, the old prefix, unit, env file and plugins are put
+   back and the old service is enabled and started again.
 
-It never touches `~/homebrew/plugins`, `settings`, `data` or `logs`, or Decky's
-`~/homebrew/services/PluginLoader`. Running it again updates Remora in place.
+Each plugin's settings, data and logs stay in `~/homebrew`, and Decky's
+`~/homebrew/services/PluginLoader` is not touched. Running it again updates Remora in place.
+Python's `cryptography` module is optional on SteamOS: without it, store sources with pinned
+signing keys are refused (`install.sh` says so); Decky's store and unpinned sources work.
 
 `uninstall.sh` stops and removes Remora's unit and install folder (only if it finds Remora's
-files there), restores Decky's unit if it was kept and Decky's binary is still there, and enables
+files there), moves the plugins and `loader.json` back to `~/homebrew`, restores Decky's unit if it was kept and Decky's binary is still there, and enables
 it. Plugins and settings stay. `--purge-config` also removes `/etc/remora`.
 
 The release tarball (`make-tarball.sh`, `PIP="uvx pip"` if the system Python has no pip) is
-`remora/{VERSION,LICENSE,remora-start,plugin_loader.service,site/}`, with `site/` holding only
+`remora/{VERSION,LICENSE,remora-start,plugin_loader.service,move-plugins.py,site/}`, with `site/` holding only
 pure-Python code: one tarball for x86_64 and aarch64, and any Python from 3.11 up. Publish
 `remora.tar.gz`, `remora.tar.gz.sha256` and `install.sh` as release assets.
 

@@ -14,8 +14,10 @@ arch=(any)
 url='https://github.com/kettlelinux/remora'
 # the frontend bundle includes @decky/ui, which is LGPL-2.1
 license=(MIT LGPL-2.1-only)
-depends=('python>=3.11' util-linux)  # setpriv, for remora-start
-makedepends=(git nodejs python-pip)
+# python-cryptography: ed25519 signatures of store sources with pinned keys (compiled, so the
+# distro's, not a wheel in the private site dir; python3 -P still sees the system site-packages)
+depends=('python>=3.11' python-cryptography util-linux)  # setpriv, for remora-start
+makedepends=(git nodejs npm python-pip)  # Arch's nodejs has no npx; npm brings it
 provides=(decky-loader)
 conflicts=(decky-loader)
 backup=(etc/remora/remora.env)

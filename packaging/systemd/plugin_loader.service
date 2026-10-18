@@ -2,12 +2,14 @@
 [Unit]
 Description=Remora (Steam Game Mode plugin loader, Decky compatible)
 After=network.target
+# keep restarting however often it fails quickly: a loader that gave up is worse
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 User=root
 Restart=always
-RestartSec=1
+RestartSec=2
 # SIGTERM to Remora, which stops each plugin (its _unload, then its process group); anything
 # still there when the timeout runs out is killed
 KillMode=mixed
