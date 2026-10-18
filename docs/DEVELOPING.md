@@ -61,7 +61,7 @@ network. Shared fixtures are in `backend/tests/conftest.py`:
 |---|---|
 | test_wsrouter.py | CALL/REPLY/ERROR, ack, FULL_SYNC replay and stale drop, DISCARD, events |
 | test_host.py | real hosts: both calling conventions, lifecycle hooks, events, crashes and restarts, compat imports, live reload, `remora call` |
-| test_server.py | Host check, auth, `/auth/token`, CORS, file routes and their link and `..` refusals, `/fetch` |
+| test_server.py | Host check, auth (and no `/auth/token`), CORS, file routes and their link and `..` refusals, `/fetch` |
 | test_fsutil.py | `O_NOFOLLOW` walks, the root-only branch with `geteuid` and `fchown` faked |
 | test_settings.py | loader.json atomic writes, unknown keys, broken files; legacy `SettingsManager` |
 | test_compat_decky.py | the `decky` module in a fresh interpreter: constants, `migrate_*`, logging |
@@ -93,14 +93,10 @@ Put plugin folders in `.scratch/home/plugins/` (or pass `--plugins DIR`). Settin
 go under `.scratch/home/`. When Remora isn't root it warns that every plugin, root ones included,
 runs as you; that's expected here.
 
-To drive it the way the frontend does, get the token and open the WebSocket. Locally,
-`/auth/token` answers only with Steam's origin:
-
-```sh
-token=$(curl -s -H 'Origin: https://steamloopback.host' http://127.0.0.1:13370/auth/token)
-```
-
-then send `{"type": 0, "id": 1, "route": "loader/get_plugins", "args": []}` frames to
+To drive it the way the frontend does, open the WebSocket with the token. Only the CDP bootstrap
+hands the token to Steam; there is no HTTP route for it. Run `remora dev` instead of `remora serve`:
+it logs the WebSocket URL with the token at startup. Take `token` from there, then send
+`{"type": 0, "id": 1, "route": "loader/get_plugins", "args": []}` frames to
 `ws://127.0.0.1:13370/ws?auth=$token`, acking each reply with `{"type": 3, "id": 1}`
 (see [PROTOCOL.md](PROTOCOL.md)). A quick smoke run worth doing after backend changes:
 

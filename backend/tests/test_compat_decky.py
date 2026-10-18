@@ -173,3 +173,39 @@ def test_migrate_any_makes_the_target_and_keeps_links(plugin_env: dict[str, str]
     assert got == {str(src): str(target)}
     assert (target / "link").is_symlink()
     assert (tmp_path / "target-of-link").read_text() == "t"
+
+
+def test_log_folder_links_are_not_followed(plugin_env: dict[str, str], tmp_path: Path) -> None:
+    """A root plugin's host must not rotate or create logs where a link the user planted points."""
+    target = tmp_path / "elsewhere"
+    target.mkdir()
+    for i in range(6):
+        (target / f"2020-01-0{i} 00.00.00.log").write_text("keep me")
+    logs = Path(plugin_env["DECKY_PLUGIN_LOG_DIR"])
+    logs.rmdir()
+    os.symlink(target, logs)
+    got = run_decky("""
+        import json, logging, decky
+        decky.logger.info("hello")
+        print(json.dumps([type(h).__name__ for h in logging.getLogger().handlers]))
+    """, plugin_env)
+    assert got == ["StreamHandler"]
+    assert len(list(target.iterdir())) == 6  # nothing deleted, nothing created
+
+
+def test_planted_log_file_link_is_not_followed(plugin_env: dict[str, str], tmp_path: Path) -> None:
+    victim = tmp_path / "victim"
+    victim.write_text("untouched")
+    got = run_decky(f"""
+        import json, os
+        log_dir = {plugin_env["DECKY_PLUGIN_LOG_DIR"]!r}
+        # plant the link where this run's log file goes, before decky opens it
+        import time
+        name = time.strftime("%Y-%m-%d %H.%M.%S") + ".log"
+        os.symlink({str(victim)!r}, os.path.join(log_dir, name))
+        import logging, decky
+        decky.logger.info("hello")
+        print(json.dumps([type(h).__name__ for h in logging.getLogger().handlers]))
+    """, plugin_env)
+    assert victim.read_text() == "untouched"
+    assert got == ["StreamHandler"] or got == ["FileHandler", "StreamHandler"]

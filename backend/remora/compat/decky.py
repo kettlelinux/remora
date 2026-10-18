@@ -90,20 +90,71 @@ async def emit(event: str, *args: Any) -> None:
 
 # -- logging -------------------------------------------------------------------------------
 
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _open_log_dir(path: str) -> int:
+    """The plugin's log folder as a directory fd, walked one component at a time without
+    following links below the user's home: a root plugin's host must not rotate or create log
+    files wherever a link the user planted points."""
+    home = os.path.realpath(DECKY_USER_HOME) if DECKY_USER_HOME else ""
+    path = os.path.abspath(path)
+    if home and (path + "/").startswith(home.rstrip("/") + "/"):
+        base, rest = home, os.path.relpath(path, home)
+    else:
+        base, rest = os.path.realpath(os.path.dirname(path)), os.path.basename(path)
+    fd = os.open(base, _DIR_FLAGS)
+    try:
+        for part in [p for p in rest.split("/") if p and p != "."]:
+            if part == "..":
+                raise OSError(f"refused {path}")
+            nfd = os.open(part, _DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _log_handler() -> logging.Handler | None:
+    if not DECKY_PLUGIN_LOG_DIR:
+        return None
+    try:
+        dir_fd = _open_log_dir(DECKY_PLUGIN_LOG_DIR)
+    except OSError:
+        return None
+    try:
+        logs = sorted(p for p in os.listdir(dir_fd) if p.endswith(".log"))
+        for old in logs[:-4]:  # Decky keeps the newest four, plus the new one
+            try:
+                os.unlink(old, dir_fd=dir_fd)
+            except OSError:
+                pass
+        fd = os.open(os.path.basename(DECKY_PLUGIN_LOG),
+                     os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644,
+                     dir_fd=dir_fd)
+        try:
+            if os.geteuid() == 0:  # a root plugin's log stays the user's to read and delete
+                st = os.fstat(dir_fd)
+                os.fchown(fd, st.st_uid, st.st_gid)
+        except OSError:
+            pass
+        handler = logging.FileHandler(DECKY_PLUGIN_LOG, encoding="utf-8", delay=True)
+        handler.stream = os.fdopen(fd, "a", encoding="utf-8")
+        return handler
+    except OSError:
+        return None
+    finally:
+        os.close(dir_fd)
+
+
 def _setup_logger() -> logging.Logger:
     root = logging.getLogger()
     handlers: list[logging.Handler] = [logging.StreamHandler()]
-    if DECKY_PLUGIN_LOG_DIR and os.path.isdir(DECKY_PLUGIN_LOG_DIR):
-        try:
-            logs = sorted(p for p in os.listdir(DECKY_PLUGIN_LOG_DIR) if p.endswith(".log"))
-            for old in logs[:-4]:  # Decky keeps the newest four, plus the new one
-                try:
-                    os.unlink(os.path.join(DECKY_PLUGIN_LOG_DIR, old))
-                except OSError:
-                    pass
-            handlers.insert(0, logging.FileHandler(DECKY_PLUGIN_LOG, encoding="utf-8"))
-        except OSError:
-            pass
+    file_handler = _log_handler()
+    if file_handler is not None:
+        handlers.insert(0, file_handler)
     logging.basicConfig(handlers=handlers, format="[%(asctime)s][%(levelname)s]: %(message)s",
                         force=True)
     root.setLevel(logging.INFO)

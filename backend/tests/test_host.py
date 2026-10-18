@@ -118,6 +118,13 @@ class Plugin:
 """
 
 
+def need_watches(manager: PluginManager) -> None:
+    """Live reload tests need inotify watches; a machine out of them (ENOSPC) skips them."""
+    err = manager.watch_error
+    if err is not None:
+        pytest.skip(f"no live reload here: {err}")
+
+
 async def call(manager: PluginManager, name: str, method: str, *args):
     return await manager.call(name, method, *args)
 
@@ -440,9 +447,11 @@ async def test_crash_fails_pending_calls_and_restarts(make_plugin, started, fast
     first_pid = await call(manager, "Modern", "pid")
     pending = asyncio.ensure_future(call(manager, "Modern", "slow", 30))
     await asyncio.sleep(0.1)
-    with pytest.raises(Discard):
+    # a crash is an error with the plugin's error text, not a DISCARD the frontend never settles
+    with pytest.raises(RouteError) as died:
         await call(manager, "Modern", "die")
-    with pytest.raises(Discard):
+    assert died.value.name == "PluginStopped" and "exited with code 3" in died.value.message
+    with pytest.raises(RouteError):
         await asyncio.wait_for(pending, 5)
     assert proc.state in (State.CRASHED, State.STARTING, State.RUNNING)
     crashed = [s for s in ws.named("remora/plugin_status") if s[0]["state"] == "crashed"]
@@ -460,18 +469,19 @@ async def test_crash_restarts_give_up_after_the_limit(make_plugin, started, fast
     assert proc is not None
     for n in range(len(fast_restarts)):
         await wait_for(lambda: proc.state == State.RUNNING, what=f"run {n}")
-        with pytest.raises(Discard):
+        with pytest.raises(RouteError):
             await call(manager, "Modern", "die")
         assert f"restarting in {fast_restarts[n]:g} s" in (proc.error or "")
     await wait_for(lambda: proc.state == State.RUNNING, what="the last run")
-    with pytest.raises(Discard):
+    with pytest.raises(RouteError):
         await call(manager, "Modern", "die")
     await wait_for(lambda: proc.state == State.CRASHED and "not restarting" in (proc.error or ""),
                    what="giving up")
     await asyncio.sleep(max(fast_restarts) + 0.2)
     assert proc.state == State.CRASHED and proc.restarts == len(fast_restarts)
-    with pytest.raises(Discard):
+    with pytest.raises(RouteError) as e:
         await call(manager, "Modern", "add", 1, 1)
+    assert "not restarting" in e.value.message
     # a reload starts it again, with a clean slate
     await manager.reload("Modern")
     assert await call(manager, "Modern", "add", 1, 1) == 2
@@ -497,12 +507,23 @@ async def test_plugin_failing_at_import(make_plugin, started, fast_restarts) -> 
     assert await call(manager, "Modern", "add", 1, 2) == 3
 
 
-async def test_call_while_failing_to_start_is_discarded(make_plugin, manager: PluginManager,
-                                                        fast_restarts) -> None:
+async def test_call_while_failing_to_start_is_an_error(make_plugin, manager: PluginManager,
+                                                       fast_restarts) -> None:
     make_plugin("broken", "Broken", "raise SystemExit('nope')\n")
     await manager.start()
-    with pytest.raises(Discard):
+    with pytest.raises(RouteError) as e:
         await asyncio.wait_for(manager.call("Broken", "x"), 5)
+    assert e.value.name == "PluginStopped"
+
+
+async def test_call_to_a_stopping_plugin_is_discarded(make_plugin, started) -> None:
+    make_plugin("modern", "Modern", MODERN)
+    manager = await started()
+    pending = asyncio.ensure_future(call(manager, "Modern", "slow", 30))
+    await asyncio.sleep(0.1)
+    await manager.disable("Modern")
+    with pytest.raises(Discard):
+        await asyncio.wait_for(pending, 5)
 
 
 async def test_missing_plugin_class(make_plugin, started, fast_restarts) -> None:
@@ -604,6 +625,7 @@ async def test_live_reload_for_debug_plugins(make_plugin, manager: PluginManager
     dbg = make_plugin("dbg", "Dbg", MODERN, flags=["debug"])
     plain = make_plugin("plain", "Plain", MODERN)
     await manager.start()
+    need_watches(manager)
     await wait_for(lambda: all(e.proc and e.proc.state == State.RUNNING for e in manager.plugins.values()))
     await asyncio.sleep(0.3)  # starting reads main.py; that must not count as a change
     (dbg / "main.py").write_text(MODERN.replace("return a + b", "return a - b"))
@@ -688,6 +710,7 @@ async def test_live_reload_after_a_rename_save(make_plugin, manager: PluginManag
     cfg.live_reload = True
     dbg = make_plugin("dbg", "Dbg", MODERN, flags=["debug"])
     await manager.start()
+    need_watches(manager)
     await wait_for(lambda: manager.plugins["Dbg"].proc.state == State.RUNNING)  # type: ignore[union-attr]
     await asyncio.sleep(0.3)
     tmp = dbg / ".main.py.swp-new"
@@ -708,6 +731,7 @@ async def test_dev_mode_single_plugin_folder(make_plugin, manager: PluginManager
     cfg.extra_plugin_dirs = [src]
     make_plugin("other", "Other", None)  # plugins/ still loads too
     await manager.start()
+    need_watches(manager)
     assert set(manager.plugins) == {"Dev Plugin", "Other"}
     await wait_for(lambda: manager.plugins["Dev Plugin"].proc.state == State.RUNNING)  # type: ignore[union-attr]
     assert await manager.call("Dev Plugin", "add", 2, 2) == 4

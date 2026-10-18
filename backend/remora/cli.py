@@ -3,6 +3,10 @@
   remora [serve]                      run the loader (what plugin_loader.service starts)
   remora dev <plugin-dir>             a local loader as you, with only that plugin, reloading on change
   remora call <plugin-dir> <method>   start just that plugin's backend, call one method, print the result
+  remora approve [name|id]            (root) approve a root plugin waiting for confirmation; no
+                                      argument: list what is waiting
+  remora deny <name|id>               (root) deny a waiting request, or revoke an approval
+  remora permissions                  (root) list the approved root plugins
 """
 
 from __future__ import annotations
@@ -148,6 +152,58 @@ async def _call_once(args: argparse.Namespace) -> int:
     return 0
 
 
+# -- approve, deny, permissions: the loader's control socket -----------------------------
+
+def _control_path(value: str | None) -> Path:
+    from .config import DEFAULT_CONTROL_SOCKET
+
+    return Path(value or os.environ.get("REMORA_CONTROL_SOCKET") or DEFAULT_CONTROL_SOCKET)
+
+
+def _is_root() -> bool:
+    return os.geteuid() == 0
+
+
+def _control(args: argparse.Namespace) -> int:
+    from .confirm import control_request
+
+    if not _is_root():
+        print(f"remora {args.command}: run this as root (sudo remora {args.command} ...)",
+              file=sys.stderr)
+        return 1
+    path = _control_path(args.socket)
+    if args.command == "approve" and not args.target:
+        message: dict[str, Any] = {"cmd": "pending"}
+    elif args.command == "permissions":
+        message = {"cmd": "list"}
+    else:
+        message = {"cmd": args.command, "target": args.target}
+    try:
+        answer = control_request(path, message)
+    except (OSError, ValueError) as e:
+        print(f"remora {args.command}: can't reach the loader at {path}: {e}", file=sys.stderr)
+        return 1
+    if not answer.get("ok"):
+        print(f"remora {args.command}: {answer.get('error')}", file=sys.stderr)
+        return 1
+    if "pending" in answer:
+        if not answer["pending"]:
+            print("nothing is waiting for approval")
+        for p in answer["pending"]:
+            print(f"{p['id']}  {p['name']} {p.get('version') or ''}  from {p.get('source') or 'local'}"
+                  f"  {p.get('what') or ''}".rstrip())
+    elif "approved" in answer:
+        if not answer["approved"]:
+            print("no root plugin is approved")
+        for a in answer["approved"]:
+            where = a.get("source") or "local"
+            state = a.get("state") or "not installed"
+            print(f"{a['name']}  source {where}  {state}")
+    else:
+        print(f"{answer.get('answered')} {answer.get('name')}")
+    return 0
+
+
 # -- main ---------------------------------------------------------------------------------
 
 def main(argv: list[str] | None = None) -> None:
@@ -195,7 +251,22 @@ def main(argv: list[str] | None = None) -> None:
                       help="seconds to let _main run before the call")
     call.add_argument("--compact", action="store_true", help="print the JSON on one line")
 
+    approve = sub.add_parser("approve", help="(root) approve a root plugin waiting for confirmation",
+                             description="Approve a root plugin that waits for confirmation (by "
+                                         "request id or plugin name), or an installed root plugin "
+                                         "that isn't approved. Without an argument, list what "
+                                         "is waiting.")
+    approve.add_argument("target", nargs="?")
+    deny = sub.add_parser("deny", help="(root) deny a waiting request, or revoke an approval")
+    deny.add_argument("target")
+    perms = sub.add_parser("permissions", help="(root) list the approved root plugins")
+    for p in (approve, deny, perms):
+        p.add_argument("--socket", default=None, help=argparse.SUPPRESS)
+
     args = parser.parse_args(argv)
+
+    if args.command in ("approve", "deny", "permissions"):
+        sys.exit(_control(args))
 
     if args.command == "dev":
         _dev(args)

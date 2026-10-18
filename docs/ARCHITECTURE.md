@@ -56,14 +56,15 @@ remora/
 
 ### Backend
 
-**Supervisor.** It is one root process and the only part that runs as root. It reads
-`loader.json`, scans `plugins/`, starts one host per plugin, and talks to hosts over a private
-socket per plugin in `/run/remora/` (mode 0700). It never uses the predictable path in `/tmp`
-(backend W7). Hosts are started with `subprocess`, not `fork()`, so they don't inherit the auth
+**Supervisor.** It is one root process and the only part that runs as root (with approved root
+plugins' hosts). It reads `loader.json`, scans `plugins/`, starts one host per plugin, and talks
+to each host over a socketpair it passes to it, never a predictable path in `/tmp` (backend W7).
+Its only listening socket besides :1337 is the root-only control socket
+`/run/remora/control.sock` (folder 0700) for `remora approve/deny/permissions`. Hosts are started with `subprocess`, not `fork()`, so they don't inherit the auth
 token, the :1337 listening socket or the supervisor's memory (backend W4).
 
 **Host.** It runs a plugin's `main.py`. A non-root plugin's host runs as the Game Mode user, with
-that user's own groups (not root's), `PR_SET_NO_NEW_PRIVS`, and a clean environment plus the
+that user's own groups (not root's) and a clean environment plus the
 `DECKY_*` variables. A root plugin's host runs as root, but only once the user has approved it
 (see Permissions). The host implements both calling conventions: `api_version` 0 passes the class
 as `self` with kwargs, 1+ uses an instance with positional args (backend §3). Children the plugin
@@ -71,21 +72,36 @@ starts stay direct children of the host, so `PR_SET_PDEATHSIG` keeps working (Ke
 Settings relies on it).
 
 **Reliability over Decky:**
-- A host that crashes is restarted with backoff, and the frontend gets a `plugin_crashed`
-  event; Decky leaves it dead (backend §4).
-- Every call has a timeout (default 30 s, per-plugin override). A non-JSON return value comes
-  back as an error instead of hanging the call (backend §3 "Results").
+- A host that crashes is restarted with backoff (1, 2, 5, 10, 30 s; it stays down after six
+  crashes in ten minutes until reloaded), and the frontend gets `remora/plugin_status`; Decky
+  leaves it dead (backend §4). Calls in flight fail with the plugin's error text, not DISCARD.
+- The host's exit is seen through a pidfd, not EOF on its pipes, so children the plugin started
+  that keep stdout open don't hide a crash or stall a stop. Its IPC socket isn't inheritable.
+- Plugin output is read in chunks; very long lines are cut in the log and never stop the relay.
+- Calls have no timeout by default, as in Decky (some plugins' calls run for minutes);
+  `REMORA_CALL_TIMEOUT` sets one. A non-JSON return value comes back as an error instead of
+  hanging the call (backend §3 "Results").
+- Lifecycle operations (start, stop, enable, disable, reload, install, uninstall, permission
+  changes) take a per-plugin lock, and starting always stops the host that is there first, so a
+  double tap never leaves two hosts.
 - Errors carry both `message` and `error`, so frontends that read either get the text
   (frontend §6).
 - `loader.json` is written atomically (temp file + rename).
 - Unload sends SIGTERM, runs `_unload`, and sends SIGKILL after 5 s, as Decky does, but tracked
   per host so one stuck plugin doesn't block the others.
 
+There is no `PR_SET_NO_NEW_PRIVS`: Kettle's plugins use `pkexec`, which it would break.
+
 **Filesystem safety.** The supervisor never runs `chown`, `chmod` or `realpath` on paths under
 `~/homebrew`. Per-plugin directories are created by a helper that runs as the user and refuses
 symlinks (`O_NOFOLLOW` walks). Settings files are never moved between the user's and root's
 directories. The user's `site-packages` are never added to a root process's `sys.path`. Plugin
 folders are never made world-writable. These close the holes in backend W3, W5, W6 and store §2.
+A root plugin doesn't start if its folders can't be made safely, and its host rotates and
+creates its log files through a directory fd with `O_NOFOLLOW`. A plugin's `dist/` that resolves
+outside the plugin's own folder is not served. The file picker lists folders as the Game Mode
+user, not as root. Remora warns at startup when it runs as root and `plugins/` is writable by
+someone else.
 
 ### Frontend
 
@@ -126,14 +142,20 @@ Kettle's welcome plugin read them (survey §8).
 
 ### Permissions
 
-The `root` flag becomes a permission the user approves. Installing or first loading a root
-plugin asks once and shows what root means. Existing root plugins migrated from Decky are
+The `root` flag becomes a permission the user approves. Any process running as the Game Mode
+user can drive Steam's UI through CEF devtools, so a click can't be the approval: it has to come
+from the device's own volume keys (held together for a second; or Kettle's `confirm-keys`
+command), or from root on a terminal (`sudo remora approve <name>`, over a root-only control
+socket). See [PROTOCOL.md](PROTOCOL.md#root-approval). Approvals are recorded per install source,
+so an update from another source asks again. Existing root plugins migrated from Decky are
 approved automatically, so migration doesn't break them, and the user can revoke them in
-settings. Later API versions may add finer permissions (network proxy, CEF tab access, file
+settings (revoking needs no confirmation). Remora's own `remora.*` settings can't be written
+through `utilities/settings/set`. Later API versions may add finer permissions (network proxy, CEF tab access, file
 picker outside home), but v1 ships only `root` to stay compatible.
 
-**Auth.** The token stays available to Steam's JS context, which needs it. `/auth/token` checks
-`Host` and `Origin`, and the token rotates on every loader start (backend W1).
+**Auth.** The token stays available to Steam's JS context, which needs it. It reaches it only
+through the CDP bootstrap; there is no `/auth/token` route (an `Origin` header proves nothing).
+Every request's `Host` is checked, and the token rotates on every loader start (backend W1).
 
 ### Developer experience
 

@@ -49,7 +49,17 @@ These parts follow the compatibility spec but could not be checked against a liv
   `state.lastErrorKey === props.errorKey`.
 - **Router remount.** Remounting under the patched ErrorBoundary rebuilds the whole Steam UI tree
   below it once at boot (Decky does the same). The memo-props fallback is untested.
-- **QAM visibility.** It is read from the QAM render argument `visible`.
+- **QAM visibility.** It is read from the QAM render argument `visible`. Until Steam passes one,
+  every mounted Remora panel reports its own document's visibility and the QAM counts as visible
+  while any live panel's document is (a panel drops out when it unmounts).
+- **Route patch remounts.** A patched route child with a memo/forwardRef type gets a new wrapped
+  type on every root render, so React remounts that page whenever the root re-renders. Caching
+  the wrapped type is not safe while plugin patches re-run (and re-patch the type) on every
+  render; see the comment on `retype` in `hooks/router.tsx`. Needs a device check.
+- **Re-injection in place.** The new instance connects its socket first and only then replaces
+  the old one. The old instance's QAM, router and ErrorBoundary patches check a `stopped` flag
+  and pass Steam's output through, and mounted QAM fibers are pointed back at the current type
+  (matched through the `__deckyPatch` chain).
 
 ## Other reliability rules
 
@@ -57,7 +67,33 @@ These parts follow the compatibility spec but could not be checked against a liv
   components, toasts) renders inside Remora's own error boundary (`PluginBoundary`), which blames
   the plugin by the URL schemes in compat/frontend.md §5.5.
 - Plugins load in parallel at boot; one failing import becomes an error entry and a toast, and
-  the rest still load.
+  the rest still load. Boot imports time out after 60 s (backend `loader/import_plugin` events:
+  15 s). Unlike the contract (which re-throws and adds nothing), a timed-out import also gets the
+  error entry with Retry and a toast; it still re-throws. If it finishes later anyway, it replaces
+  the entry, or gets `onDismount()` if something newer replaced it. Update checks and the
+  SP-crash check start without waiting for the imports.
+- Imports of one name run one at a time, and each import request and each unload bumps a
+  per-name generation. An import whose generation is stale when its turn comes is skipped; one
+  that finishes stale is dismounted, never added. So an unload or disable during an import wins,
+  and of two imports the newest wins.
+- After every reconnect (not the first connect) the loader re-reads `remora/status`, the
+  settings and `loader/get_plugins`, then imports missing plugins, reloads ones whose version
+  changed (or that failed to load), and unloads ones that are gone or disabled: events sent
+  during the gap are lost.
+- WebSocket call ids start at a random base per JS context, so a reloaded context never gets
+  replies the backend cached for the previous one.
+- The SP-crash check looks three more times over about 2 s before it restarts the web helper.
+- Hook status writes that happen during a render are published in a microtask, and writes that
+  change nothing are skipped.
+- Unloading a plugin empties its `@decky/api` listener map but keeps it registered, so a reload
+  whose `@decky/api` module is cached (no new `connect()`) still gets its events.
+- Root approval: after Allow (install prompt or Permissions page) the backend waits for a
+  physical confirm or a terminal command. `remora/confirm_waiting` opens a modal (and an inline
+  card in the QAM panel and store) with the hint and a countdown; `remora/confirm_done` closes it
+  and toasts the result. Cancel only closes the UI. Install and root prompt modals are closed by
+  code when the prompt is answered inline or expires.
+- Remora's own `remora.*` settings are written with `remora/settings/set`; a refused write puts
+  the old value back in the UI.
 - Each loader setup step (error boundary, report filter, toaster, QAM tab, router, pages) runs in
   its own try/catch.
 - `frontend/test/smoke.mjs` boots the build against a fake Steam that has none of Steam's UI

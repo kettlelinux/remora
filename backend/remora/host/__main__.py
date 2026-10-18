@@ -19,7 +19,7 @@ import sys
 import traceback
 from typing import Any
 
-from remora.ipc import Channel
+from remora.ipc import Channel, encode
 
 log = logging.getLogger("remora.host")
 
@@ -94,10 +94,10 @@ class Host:
     # -- messages ----------------------------------------------------------------------------
 
     async def emit(self, event: str, *args: Any) -> None:
-        message = {"t": "event", "event": str(event), "args": list(args)}
-        json.dumps(message, ensure_ascii=False)  # raise in the plugin, not in the channel
+        # encode here: a value that isn't JSON raises in the plugin, not in the channel
+        data = encode({"t": "event", "event": str(event), "args": list(args)})
         if self.channel is not None:
-            await self.channel.send(message)
+            await self.channel.send_encoded(data)
 
     async def _call(self, message: dict[str, Any]) -> None:
         call_id = message.get("id")
@@ -117,15 +117,14 @@ class Host:
                     raise RuntimeError("api_version 1 or newer is required to call plugin "
                                        "methods with this API")
                 value = await self._invoke(method, *(message.get("args") or []))
-            reply = {"t": "result", "id": call_id, "ok": True, "value": value}
-            try:
-                json.dumps(reply, ensure_ascii=False)
+            try:  # serialized once, here: big results aren't encoded twice
+                data = encode({"t": "result", "id": call_id, "ok": True, "value": value})
             except (TypeError, ValueError) as e:
                 raise TypeError(f"{method} returned a value that isn't JSON: {e}") from e
         except Exception as e:
-            reply = {"t": "result", "id": call_id, "ok": False, "error": _error(e)}
+            data = encode({"t": "result", "id": call_id, "ok": False, "error": _error(e)})
         assert self.channel is not None
-        await self.channel.send(reply)
+        await self.channel.send_encoded(data)
 
     def _spawn(self, coro: Any) -> None:
         task = asyncio.ensure_future(coro)
@@ -166,6 +165,9 @@ class Host:
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, lambda: self._spawn(self.stop(False)))
+        # not inherited by what the plugin runs (os.system, subprocess): a child holding the
+        # socket would hide this host's exit from the supervisor
+        os.set_inheritable(self.spec["fd"], False)
         sock = socket.socket(fileno=self.spec["fd"])
         self.channel = await Channel.from_socket(sock)
         # serve first, so stop requests and queued calls work while _migration runs

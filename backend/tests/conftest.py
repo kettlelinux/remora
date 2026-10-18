@@ -85,6 +85,11 @@ def cfg(home: Path) -> Config:
         live_reload=False,
         inject=False,
         stop_timeout=3.0,
+        # never the workstation's own volume keys; tests that confirm pick a mode
+        confirm="terminal",
+        terminal_timeout=5.0,
+        input_sysfs=home / "no-sysfs",
+        input_dev=home / "no-dev",
     )
 
 

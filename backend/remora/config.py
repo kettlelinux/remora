@@ -11,6 +11,9 @@ from pathlib import Path
 from . import DECKY_COMPAT_VERSION, __version__
 
 
+DEFAULT_CONTROL_SOCKET = "/run/remora/control.sock"
+
+
 def _flag(name: str, default: bool) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -66,6 +69,16 @@ class Config:
     extra_plugin_dirs: list[Path] = field(default_factory=list)
     # live-reload every plugin on change, not only those with the "debug" flag (remora dev)
     reload_all: bool = False
+    # root approval (remora/confirm.py): "auto", "command", "keys" or "terminal"
+    confirm: str = "auto"
+    confirm_command: str = ""  # REMORA_CONFIRM_COMMAND, run as `<command> "<what>"`
+    confirm_keys: list[str] = field(default_factory=list)  # input names allowed in keys mode
+    confirm_timeout: float = 30.0  # keys and command
+    terminal_timeout: float = 300.0  # waiting for `remora approve`
+    # the root-only control socket for `remora approve/deny/permissions`; None: none
+    control_socket: Path | None = None
+    input_sysfs: Path = Path("/sys/class/input")
+    input_dev: Path = Path("/dev/input")
 
     @property
     def plugins_dir(self) -> Path:
@@ -86,6 +99,9 @@ class Config:
         homebrew = Path(os.environ.get("UNPRIVILEGED_PATH") or home / "homebrew")
         privileged = Path(os.environ.get("PRIVILEGED_PATH") or homebrew)
         level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
+        control = os.environ.get("REMORA_CONTROL_SOCKET")
+        if not control and os.geteuid() == 0:
+            control = DEFAULT_CONTROL_SOCKET
         return cls(
             user=entry.pw_name,
             uid=entry.pw_uid,
@@ -101,4 +117,8 @@ class Config:
             inject=_flag("REMORA_INJECT", True),
             call_timeout=float(os.environ.get("REMORA_CALL_TIMEOUT", "0")),
             decky_version=os.environ.get("REMORA_DECKY_VERSION", DECKY_COMPAT_VERSION),
+            confirm=os.environ.get("REMORA_CONFIRM", "auto").strip().lower() or "auto",
+            confirm_command=os.environ.get("REMORA_CONFIRM_COMMAND", "").strip(),
+            confirm_keys=os.environ.get("REMORA_CONFIRM_KEYS", "").split(),
+            control_socket=Path(control) if control else None,
         )
