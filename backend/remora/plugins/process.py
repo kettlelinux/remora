@@ -138,6 +138,8 @@ class PluginProcess:
             return
         self._stopping = False
         self._stopped_msg = asyncio.Event()
+        # before the first await: a call that comes in while the host starts waits for it
+        self._ready = asyncio.get_running_loop().create_future()
         await self._set_state(State.STARTING)
         parent_sock, child_sock = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
         spec = {
@@ -172,12 +174,13 @@ class PluginProcess:
             )
         except OSError as e:
             parent_sock.close()
+            self._ready.set_exception(PluginStopped(f"could not start: {e}"))
+            self._ready.exception()  # mark retrieved
             await self._set_state(State.CRASHED, f"could not start: {e}")
             return
         finally:
             child_sock.close()  # the host has its own copy
         self.channel = await Channel.from_socket(parent_sock)
-        self._ready = asyncio.get_running_loop().create_future()
         self._spawn(self._relay_output(self.proc))
         self._spawn(self._read(self.channel, self.proc))
         log.info("started %s (pid %d%s)", self.name, self.proc.pid, ", root" if self.info.root else "")

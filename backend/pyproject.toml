@@ -18,6 +18,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+# store index signatures (ed25519); without it, signed versions show as unchecked
+signing = ["cryptography>=41"]
 
 [project.scripts]
 remora = "remora.cli:main"

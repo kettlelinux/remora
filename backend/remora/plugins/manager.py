@@ -117,6 +117,12 @@ class PluginManager:
         self.cfg.plugins_dir.mkdir(parents=True, exist_ok=True)
         infos, errors = manifest.scan(self.cfg.plugins_dir)
         for extra in self.cfg.extra_plugin_dirs:
+            if (extra / "plugin.json").is_file():  # a single plugin's folder
+                try:
+                    infos.append(manifest.read_plugin(extra))
+                except manifest.ManifestError as e:
+                    errors.append((extra, str(e)))
+                continue
             more, more_errors = manifest.scan(extra)
             infos += more
             errors += more_errors
@@ -308,16 +314,13 @@ class PluginManager:
         manager = self
 
         def changed(path: str) -> None:
-            if manager._watch_paused or "__pycache__" in path:
+            if manager._watch_paused or "__pycache__" in path or "/node_modules/" in path:
                 return
             if not (path.endswith("main.py") or path.endswith("/dist/index.js") or path.endswith(".py")):
                 return
-            try:
-                rel = Path(path).relative_to(manager.cfg.plugins_dir)
-            except ValueError:
-                return
-            entry = manager.find_dir(rel.parts[0]) if rel.parts else None
-            if entry is None or not entry.info.debug:
+            entry = next((e for e in manager.plugins.values()
+                          if path.startswith(str(e.info.path) + "/")), None)
+            if entry is None or not (entry.info.debug or manager.cfg.reload_all):
                 return  # as in Decky, only "debug" plugins reload on their own
             name = entry.info.name
             if name in pending:
@@ -330,9 +333,13 @@ class PluginManager:
                 if not event.is_directory and event.event_type in ("modified", "created", "moved",
                                                                    "deleted", "closed"):
                     loop.call_soon_threadsafe(changed, str(event.src_path))
+                    # editors and sed -i save by renaming a temp file over the original
+                    if getattr(event, "dest_path", ""):
+                        loop.call_soon_threadsafe(changed, str(event.dest_path))
 
         observer = Observer()
-        observer.schedule(Handler(), str(self.cfg.plugins_dir), recursive=True)
+        for folder in [self.cfg.plugins_dir, *self.cfg.extra_plugin_dirs]:
+            observer.schedule(Handler(), str(folder), recursive=True)
         observer.daemon = True
         observer.start()
         self._observer = observer
