@@ -26,11 +26,11 @@ function FallbackRow({ children }: AnyProps) {
   return <div style={box}>{children}</div>;
 }
 
-function FallbackButton({ children, onClick, disabled, label, description, style }: AnyProps) {
+function FallbackButton({ children, onClick, disabled, label, description, style, autoFocus }: AnyProps) {
   return (
     <div style={box}>
       {label && <div>{label}</div>}
-      <button disabled={disabled} onClick={onClick} style={{ width: '100%', padding: 8, ...style }}>
+      <button disabled={disabled} onClick={onClick} autoFocus={Boolean(autoFocus)} style={{ width: '100%', padding: 8, ...style }}>
         {children}
       </button>
       {description && <div style={{ fontSize: 12, opacity: 0.7 }}>{description}</div>}

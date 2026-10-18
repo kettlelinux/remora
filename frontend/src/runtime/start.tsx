@@ -45,7 +45,6 @@ function registerPages(loader: PluginLoader): void {
 }
 
 export async function start(): Promise<void> {
-  replacePrevious();
   try {
     setLanguage(navigator.language);
   } catch {
@@ -60,9 +59,12 @@ export async function start(): Promise<void> {
   }
   watchUIMode();
 
+  // The previous instance keeps running until the new socket is up (or the connect wait ends),
+  // so a re-injection while the backend restarts does not leave the UI with no loader at all.
   const backend = new Backend();
-  window.DeckyBackend = backend;
   await backend.connect();
+  replacePrevious();
+  window.DeckyBackend = backend;
 
   const loader = new PluginLoader(backend);
   window.DeckyPluginLoader = loader;

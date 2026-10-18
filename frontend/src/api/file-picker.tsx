@@ -27,6 +27,10 @@ export function filePickerApi(backend: Backend) {
     new Promise<FilePickerRes>((resolve, reject) => {
       const folderMode = select === FOLDER;
       let picked = false;
+      let hasClosedPromise = false;
+      const cancel = () => {
+        if (!picked) reject('User canceled');
+      };
       const modal = showModal(
         <FilePickerModal
           backend={backend}
@@ -45,6 +49,10 @@ export function filePickerApi(backend: Backend) {
             picked = true;
             resolve(res);
           }}
+          // without a ClosedPromise, the modal unmounting is the only sign it was closed
+          onUnmount={() => {
+            if (!hasClosedPromise) cancel();
+          }}
         />,
         folderMode ? t('picker.titleFolder') : t('picker.title'),
       );
@@ -52,9 +60,10 @@ export function filePickerApi(backend: Backend) {
         reject(new Error(t('picker.unavailable')));
         return;
       }
-      void modal.ClosedPromise?.then(() => {
-        if (!picked) reject('User canceled');
-      });
+      if (modal.ClosedPromise && typeof modal.ClosedPromise.then === 'function') {
+        hasClosedPromise = true;
+        void modal.ClosedPromise.then(cancel);
+      }
     });
 
   /** Legacy ServerAPI form: selectFiles true = FILE mode (files and folders), false = folders only. */

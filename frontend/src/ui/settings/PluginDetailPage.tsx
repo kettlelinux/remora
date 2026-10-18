@@ -1,5 +1,5 @@
 // One installed plugin: state, actions and its log.
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { ButtonItem, Field, Focusable, PanelSection, PanelSectionRow } from '../../hooks/components';
 import { navigateBack } from '../../hooks/navigation';
 import type { PluginLoader } from '../../runtime/plugin-loader';
@@ -8,6 +8,12 @@ import { ConfirmButton } from '../common/ConfirmButton';
 import { t } from '../i18n';
 import { useStore } from '../react-utils';
 import { usePluginNameParam } from './use-route-param';
+
+/** Lines per focusable log chunk: the gamepad scrolls the log by moving focus chunk to chunk. */
+const LOG_CHUNK = 20;
+/** Set once the backend answers remora/store/rollback with RouteNotFoundError (older backend). */
+let rollbackUnsupported = false;
+const isRouteNotFound = (e: unknown) => e instanceof Error && e.name.endsWith('RouteNotFoundError');
 
 export function PluginDetailPage({ loader }: { loader: PluginLoader }) {
   const name = usePluginNameParam();
@@ -18,6 +24,14 @@ export function PluginDetailPage({ loader }: { loader: PluginLoader }) {
   const [log, setLog] = useState<string>();
   const [busy, setBusy] = useState<string>();
   const [error, setError] = useState<string>();
+  const [canRollback, setCanRollback] = useState(!rollbackUnsupported);
+  const logChunks = useMemo(() => {
+    if (!log) return [];
+    const lines = log.split('\n');
+    const out: { from: number; text: string }[] = [];
+    for (let i = 0; i < lines.length; i += LOG_CHUNK) out.push({ from: i + 1, text: lines.slice(i, i + LOG_CHUNK).join('\n') });
+    return out;
+  }, [log]);
 
   const p = installed.find((x) => x.name === name);
   const st = name ? statuses[name] : undefined;
@@ -76,6 +90,25 @@ export function PluginDetailPage({ loader }: { loader: PluginLoader }) {
             </ButtonItem>
           </PanelSectionRow>
         )}
+        {canRollback && (
+          <PanelSectionRow>
+            <ConfirmButton
+              label={t('plugins.rollback')}
+              description={t('plugins.rollbackDesc')}
+              confirmText={t('plugins.rollbackDesc')}
+              disabled={!!busy}
+              onConfirm={run('rollback', async () => {
+                try {
+                  await loader.backend.call('remora/store/rollback', name);
+                } catch (e) {
+                  if (!isRouteNotFound(e)) throw e;
+                  rollbackUnsupported = true;
+                  setCanRollback(false);
+                }
+              })}
+            />
+          </PanelSectionRow>
+        )}
         {!p.disabled && (
           <PanelSectionRow>
             <ButtonItem layout="below" disabled={!!busy} onClick={run('reload', () => loader.reloadPlugin(name))}>
@@ -122,10 +155,24 @@ export function PluginDetailPage({ loader }: { loader: PluginLoader }) {
             {t('logs.refresh')}
           </ButtonItem>
         </PanelSectionRow>
-        <Focusable onActivate={() => {}} style={{ background: 'rgba(0,0,0,0.35)', borderRadius: 4, padding: 8 }}>
-          <pre style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 11, margin: 0 }}>{log === undefined ? t('common.loading') : log || t('logs.empty')}</pre>
-        </Focusable>
+        {logChunks.length === 0 ? (
+          <Focusable onActivate={() => {}} style={logBox}>
+            <pre style={logPre}>{log === undefined ? t('common.loading') : t('logs.empty')}</pre>
+          </Focusable>
+        ) : (
+          // one focusable per chunk, so D-pad down walks (and scrolls) through a long log
+          <Focusable flow-children="vertical" style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+            {logChunks.map((c) => (
+              <Focusable key={c.from} onActivate={() => {}} style={logBox} aria-label={t('logs.lines', { from: c.from, to: c.from + LOG_CHUNK - 1 })}>
+                <pre style={logPre}>{c.text}</pre>
+              </Focusable>
+            ))}
+          </Focusable>
+        )}
       </PanelSection>
     </Focusable>
   );
 }
+
+const logBox = { background: 'rgba(0,0,0,0.35)', borderRadius: 4, padding: 8 } as const;
+const logPre = { whiteSpace: 'pre-wrap', wordBreak: 'break-word', fontSize: 11, margin: 0 } as const;

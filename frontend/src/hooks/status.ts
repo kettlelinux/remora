@@ -20,13 +20,24 @@ export interface HookStatus {
 export const hookStatuses = new Store<HookStatus[]>([]);
 const log = logger('hooks');
 
+// The current state is kept here synchronously (HookHandle.state reads it right after a write);
+// the Store is published in a microtask, because some writes happen while React renders (router
+// transform, QAM render patch) and a Store listener must not set state during a render.
+const current = new Map<string, HookStatus>();
+let flushQueued = false;
+
+function same(a: HookStatus | undefined, b: HookStatus): boolean {
+  return !!a && a.state === b.state && a.strategy === b.strategy && a.detail === b.detail && a.feature === b.feature;
+}
+
 function put(s: HookStatus): void {
-  hookStatuses.update((all) => {
-    const i = all.findIndex((x) => x.id === s.id);
-    const next = all.slice();
-    if (i >= 0) next[i] = s;
-    else next.push(s);
-    return next;
+  if (same(current.get(s.id), s)) return;
+  current.set(s.id, s);
+  if (flushQueued) return;
+  flushQueued = true;
+  queueMicrotask(() => {
+    flushQueued = false;
+    hookStatuses.set([...current.values()]);
   });
 }
 
@@ -35,8 +46,7 @@ export class HookHandle {
     readonly id: string,
     readonly feature: string,
   ) {
-    const existing = hookStatuses.get().find((s) => s.id === id);
-    if (!existing) put({ id, feature, state: 'pending', updated: Date.now() });
+    if (!current.has(id)) put({ id, feature, state: 'pending', updated: Date.now() });
   }
 
   ok(strategy: string, detail?: string): void {
@@ -59,7 +69,7 @@ export class HookHandle {
   }
 
   get state(): HookState {
-    return hookStatuses.get().find((s) => s.id === this.id)?.state ?? 'pending';
+    return current.get(this.id)?.state ?? 'pending';
   }
 }
 

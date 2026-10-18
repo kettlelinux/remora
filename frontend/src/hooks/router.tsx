@@ -119,7 +119,17 @@ function getAt(el: El, loc: Loc): SteamAny {
   return cur?.props?.children;
 }
 
-/** A per-render copy of a route's child, so plugin patches never touch Steam's own element. */
+/**
+ * A per-render copy of a route's child, so plugin patches never touch Steam's own element.
+ *
+ * Known cost (finding 17, needs a device check before changing): for memo/forwardRef children,
+ * wrapReactType makes a new type object on every root render, so React remounts the patched
+ * page whenever the root re-renders. Caching the wrapped type per (original type, patch-list
+ * version) is NOT safe as things stand: route patches run on every render and commonly
+ * afterPatch() the wrapped type in place, so a cached type would collect one more patch per
+ * render (handlers run N times). Fixing it needs patches to be applied once per cached type,
+ * which changes when plugin patch code runs; left as is until it can be tested on hardware.
+ */
 function retype(child: SteamAny): SteamAny {
   if (!isEl(child)) return child;
   const copy: SteamAny = { ...child, props: { ...(child.props as object) } };
@@ -250,7 +260,8 @@ export class RouterHook {
     }
     try {
       this.rootPatch = afterPatch(et, 'type', (_args: unknown[], ret: SteamAny) => {
-        if (!isEl(ret) || ret.type === RouterHost) return ret;
+        // after deinit (re-injection), a fiber may still call this function: pass Steam through
+        if (this.stopped || !isEl(ret) || ret.type === RouterHost) return ret;
         return <RouterHost tree={ret} hook={this} />;
       });
       fiber.type = et.type;

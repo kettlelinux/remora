@@ -1,7 +1,9 @@
 // The @decky/api init hook: window.__DECKY_SECRET_INTERNALS_..._deckyLoaderAPIInit. Every
 // modern plugin bundles @decky/api, which calls connect(2, name) (falling back to 1) when the
 // plugin module is evaluated. connect never throws, and each call gives that plugin a fresh
-// event listener map, so a reloaded plugin starts with no stale listeners.
+// event listener map, so a reloaded plugin starts with no stale listeners. Unloading only
+// empties the map: a reloaded plugin whose @decky/api module is cached (no new connect()) keeps
+// adding listeners to the map it already holds, and those must still get events.
 import type { Backend, EventListener } from '../runtime/backend';
 import type { RouterHook } from '../hooks/router';
 import type { Toaster } from '../hooks/toaster';
@@ -90,7 +92,8 @@ export class PluginApiHost implements InitHook {
     }
   }
 
-  forget(plugin: string): void {
-    this.listeners.delete(plugin);
+  /** On unload: drops the plugin's listeners but keeps its map registered (see the header). */
+  clearListeners(plugin: string): void {
+    this.listeners.get(plugin)?.clear();
   }
 }

@@ -57,7 +57,15 @@ g.WebSocket = class {
   }
   close() {}
 };
+g.__slow = { n: 0, dismounted: [] };
 g.fetch = async (url, opts) => {
+  if (String(url).includes('/plugins/Slow/frontend_bundle')) {
+    await new Promise((r) => setTimeout(r, 80));
+    return { ok: true, text: async () => '(function(){ return function(){ const n = ++globalThis.__slow.n; return { content: "S" + n, onDismount: () => globalThis.__slow.dismounted.push(n) }; }; })()' };
+  }
+  if (String(url).includes('/plugins/Hang/frontend_bundle')) {
+    return new Promise((_, rej) => opts.signal.addEventListener('abort', () => rej(new Error('aborted'))));
+  }
   if (String(url).includes('/plugins/Legacy/frontend_bundle')) {
     if (opts.headers['X-Decky-Auth'] !== 'tok') throw new Error('no auth header');
     return { ok: true, text: async () => '(function(){ return function(serverAPI){ globalThis.__legacyApi = serverAPI; return { name: "wrong", title: "T", content: "C", icon: "I" }; }; })()' };
@@ -111,6 +119,40 @@ await new Promise((r) => setTimeout(r, 200));
 check(L.plugins.get().find((p) => p.name === 'Legacy').version === '1.0.1', 'reload via loader/import_plugin');
 sock.onmessage({ data: JSON.stringify({ type: 5, event: 'loader/unload_plugin', args: ['Legacy'] }) });
 check(!L.plugins.get().find((p) => p.name === 'Legacy'), 'unload_plugin');
+const ev = (event, ...args) => sock.onmessage({ data: JSON.stringify({ type: 5, event, args }) });
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+check(sent.find((m) => m.type === 0).id > 1000, 'call ids start at a random base');
+// an unload that arrives while the import is in flight wins; the late result is dismounted
+ev('loader/import_plugin', 'Slow', '1', 0, false);
+await wait(10);
+ev('loader/unload_plugin', 'Slow');
+await wait(200);
+check(!L.plugins.get().find((p) => p.name === 'Slow') && g.__slow.dismounted.join() === '1', 'unload during an import wins: ' + g.__slow.dismounted.join());
+// two imports of one name: the newest wins, the first one's result is dismounted
+ev('loader/import_plugin', 'Slow', '2', 0, false);
+await wait(10); // the first one is fetching
+ev('loader/import_plugin', 'Slow', '3', 0, false);
+await wait(400);
+const slow = L.plugins.get().filter((p) => p.name === 'Slow');
+check(slow.length === 1 && slow[0].version === '3' && g.__slow.dismounted.join() === '1,2', 'newest of two imports wins: ' + slow.map((p) => p.version) + ' / ' + g.__slow.dismounted.join());
+// a timed-out import leaves an error entry (with Retry) instead of vanishing
+ev('loader/import_plugin', 'Hang', '1', 0, false, 50);
+await wait(150);
+check(L.plugins.get().find((p) => p.name === 'Hang')?.loadError, 'timed-out import gives an error placeholder');
+// Remora's own settings go through remora/settings/set
+await L.settings.set('remora.storeTelemetry', true);
+await L.settings.set('sortPlugins', false);
+check(sent.some((m) => m.route === 'remora/settings/set' && m.args[0] === 'remora.storeTelemetry') && sent.some((m) => m.route === 'utilities/settings/set' && m.args[0] === 'sortPlugins') && !sent.some((m) => m.route === 'utilities/settings/set' && String(m.args[0]).startsWith('remora.')), 'remora.* settings use remora/settings/set');
+// root confirm: confirm_waiting shows the wait, confirm_done closes it
+ev('remora/confirm_waiting', 'r1', 'Root Plug', 'keys', 'Hold Volume Up and Volume Down together for a second', Date.now() / 1000 + 30);
+check(L.installs.confirm.get()?.name === 'Root Plug' && L.installs.confirm.get().until > Date.now(), 'confirm_waiting opens the confirm UI');
+ev('remora/confirm_done', 'r1', 'Root Plug', true);
+check(L.installs.confirm.get() === null, 'confirm_done closes it');
+ev('remora/root_prompt', 'r2', 'Root Plug', '1.0', 'terminal', 'Run `sudo remora approve Root Plug` in a terminal on this device');
+const rp = L.installs.prompts.get().find((p) => p.requestId === 'r2');
+check(rp && rp.hint.includes('sudo remora approve'), 'root_prompt carries mode and hint');
+await L.installs.answer(rp, false);
+check(!L.installs.prompts.get().length && sent.some((m) => m.route === 'remora/store/answer_root' && m.args[0] === 'r2' && m.args[1] === false), 'root prompt answered');
 // reconnect sends FULL_SYNC with pending calls
 const pend = L.backend.call('remora/never');
 sent.length = 0;
@@ -170,6 +212,9 @@ console.log('console errors:', errors.length);
 setTimeout(() => {
   const fs = sent.find((m) => m.type === 4);
   check(fs && fs.messages.some((m) => m.route === 'remora/never'), 'reconnect resends pending in FULL_SYNC');
+  // the resync after the reconnect: Legacy (unloaded above) is back, Slow/Hang (not listed) are gone
+  const now = L.plugins.get().map((p) => p.name).sort().join(',');
+  check(now === 'Esm Plug,Legacy', 'reconnect resync imports missing and unloads unlisted plugins: ' + now);
   process.exit();
-}, 5600);
+}, 6200);
 void pend;

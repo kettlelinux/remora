@@ -3,7 +3,7 @@
 // every (re)connect; the backend answers ids it already ran from its reply cache.
 import { logger } from '../util/logger';
 import { Store } from '../util/store';
-import { currentToken, refreshToken } from './token';
+import { currentToken } from './token';
 
 const enum MessageType {
   ERROR = -1,
@@ -54,12 +54,15 @@ const log = logger('backend');
 export class Backend {
   /** true while the socket is open. */
   readonly connected = new Store<boolean>(false);
+  /** Counts successful opens: 1 after the first connect, 2+ after reconnects. */
+  readonly opens = new Store<number>(0);
   private ws?: WebSocket;
-  private nextId = 1;
+  // Ids start at a random base per JS context: the backend's reply cache is keyed by id, so a
+  // reloaded context counting from 1 again would get another context's cached replies.
+  private nextId = Math.floor(Math.random() * 2 ** 40) + 1;
   private pending = new Map<number, PendingCall>();
   private listeners = new Map<string, Set<EventListener>>();
   private stopped = false;
-  private failedOpens = 0;
   private firstOpen?: Promise<void>;
 
   /** Starts connecting; resolves on the first open, or after `waitMs` (calls queue meanwhile). */
@@ -81,14 +84,13 @@ export class Backend {
 
   private async open(): Promise<void> {
     if (this.stopped) return;
-    let token = currentToken();
-    if (!token || this.failedOpens >= 2) token = (await refreshToken()) ?? token;
+    // a restarted backend has a new token; its bootstrap sets the globals again
+    const token = currentToken();
     if (!token) {
       log.warn('no auth token yet');
       this.scheduleReconnect();
       return;
     }
-    let opened = false;
     let ws: WebSocket;
     try {
       ws = new WebSocket(`${WS_URL}?auth=${encodeURIComponent(token)}`);
@@ -99,10 +101,9 @@ export class Backend {
     }
     this.ws = ws;
     ws.onopen = () => {
-      opened = true;
-      this.failedOpens = 0;
       this.send({ type: MessageType.FULL_SYNC, messages: [...this.pending.values()].map((p) => p.msg) });
       this.connected.set(true);
+      this.opens.set(this.opens.get() + 1);
       log.info(`connected (${this.pending.size} call(s) resent)`);
     };
     ws.onmessage = (ev) => this.onMessage(ev.data);
@@ -110,7 +111,6 @@ export class Backend {
       if (this.ws !== ws) return;
       this.ws = undefined;
       this.connected.set(false);
-      if (!opened) this.failedOpens++;
       if (!this.stopped) {
         log.warn(`socket closed; reconnecting in ${RECONNECT_MS / 1000} s`);
         this.scheduleReconnect();

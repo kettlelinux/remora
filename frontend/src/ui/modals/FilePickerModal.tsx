@@ -1,5 +1,5 @@
 // The file picker plugins open with openFilePicker: a Steam modal over utilities/filepicker_ls.
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { DialogButton, Focusable, ModalRoot, Spinner, ToggleField } from '../../hooks/components';
 import type { Backend } from '../../runtime/backend';
 import { errorText } from '../../util/errors';
@@ -19,6 +19,8 @@ interface Listing {
   realpath: string;
   files: FileEntry[];
   total: number;
+  /** Entries fetched so far, before the client-side filter (what `total` counts). */
+  loaded: number;
 }
 
 export interface FilePickerOptions {
@@ -37,21 +39,31 @@ interface Props {
   backend: Backend;
   options: FilePickerOptions;
   onPick: (res: { path: string; realpath: string }) => void;
+  /** Called on unmount when no ClosedPromise tells the caller the modal went away. */
+  onUnmount?: () => void;
   closeModal?: () => void;
 }
 
 const join = (dir: string, name: string) => `${dir.replace(/\/+$/, '')}/${name}`;
 const parent = (p: string) => p.replace(/\/+$/, '').replace(/\/[^/]*$/, '') || '/';
 
-export function FilePickerModal({ backend, options, onPick, closeModal }: Props) {
+export function FilePickerModal({ backend, options, onPick, onUnmount, closeModal }: Props) {
   const [path, setPath] = useState<string | undefined>(options.startPath);
   const [listing, setListing] = useState<Listing>();
   const [page, setPage] = useState(1);
   const [error, setError] = useState<string>();
   const [hidden, setHidden] = useState(options.showHiddenFiles);
   const [allFiles, setAllFiles] = useState(false);
+  /** Only the newest request may write state; older answers are dropped. */
+  const seq = useRef(0);
+  /** The path the first (no start path) load resolved to: setting it must not load it again. */
+  const resolved = useRef<string | undefined>(undefined);
+  const unmount = useRef(onUnmount);
+  unmount.current = onUnmount;
+  useEffect(() => () => unmount.current?.(), []);
 
   const load = async (p: string | undefined, pg: number) => {
+    const my = ++seq.current;
     setError(undefined);
     try {
       const ext = allFiles || !options.extensions?.length ? null : options.extensions;
@@ -68,18 +80,29 @@ export function FilePickerModal({ backend, options, onPick, closeModal }: Props)
         pg,
         options.max,
       );
+      if (my !== seq.current) return;
       const f = options.filter;
       const fn = f instanceof RegExp ? (e: FileEntry) => e.name.search(f) >= 0 : f;
       const files = fn ? r.files.filter((f) => f.isdir || safeTest(fn, f)) : r.files;
-      setListing((prev) => (pg > 1 && prev ? { ...r, files: [...prev.files, ...files] } : { ...r, files }));
-      if (p === undefined) setPath(r.realpath);
+      setListing((prev) =>
+        pg > 1 && prev ? { ...r, files: [...prev.files, ...files], loaded: prev.loaded + r.files.length } : { ...r, files, loaded: r.files.length },
+      );
+      if (p === undefined) {
+        resolved.current = r.realpath;
+        setPath(r.realpath);
+      }
     } catch (e) {
-      setError(errorText(e));
+      if (my === seq.current) setError(errorText(e));
     }
   };
 
   useEffect(() => {
     setPage(1);
+    if (path !== undefined && path === resolved.current) {
+      resolved.current = undefined; // already loaded by the request that found it
+      return;
+    }
+    resolved.current = undefined;
     void load(path, 1);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path, hidden, allFiles]);
@@ -122,7 +145,7 @@ export function FilePickerModal({ backend, options, onPick, closeModal }: Props)
             <span style={{ overflow: 'hidden', textOverflow: 'ellipsis' }}>{f.name}</span>
           </DialogButton>
         ))}
-        {listing && listing.files.length < listing.total && (
+        {listing && listing.loaded < listing.total && (
           <DialogButton
             onClick={() => {
               const next = page + 1;

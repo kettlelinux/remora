@@ -14,6 +14,17 @@ const hook = new HookHandle('qam-tab', "Remora's Quick Access tab (plugins' pane
 const log = logger('qam-tab');
 
 const MARKERS = ['QuickAccessMenuBrowserView', 'QuickAccessMenuEmbedded'];
+
+/** The unpatched function under a chain of @decky/ui patches (each keeps __deckyPatch.original). */
+function chainBase(fn: SteamAny): SteamAny {
+  const seen = new Set<unknown>();
+  let cur = fn;
+  while (typeof cur === 'function' && cur.__deckyPatch?.original && !seen.has(cur)) {
+    seen.add(cur);
+    cur = cur.__deckyPatch.original;
+  }
+  return cur;
+}
 const hasTabs = (n: SteamAny) => Array.isArray(n?.props?.tabs);
 
 function qamExports(module: SteamAny, test: (src: string) => boolean): SteamAny[] {
@@ -32,9 +43,12 @@ function qamExports(module: SteamAny, test: (src: string) => boolean): SteamAny[
 
 export class TabsHook {
   private patches: Patch[] = [];
+  /** The memo objects patched, to point mounted fibers at their current type on deinit. */
+  private patched: SteamAny[] = [];
   private tab?: SteamAny;
   private renders = 0;
   private injected = false;
+  private stopped = false;
 
   constructor(
     private icon: () => ReactNode,
@@ -72,6 +86,7 @@ export class TabsHook {
     const inner = createReactTreePatcher(
       [(tree: SteamAny) => findInReactTree(tree, (n: SteamAny) => n?.props?.onFocusNavDeactivated !== undefined)],
       (_args: unknown[], ret: SteamAny) => {
+        if (this.stopped) return ret;
         const node = findInReactTree(ret, hasTabs);
         if (node) this.inject(node.props.tabs);
         return ret;
@@ -81,8 +96,10 @@ export class TabsHook {
 
     try {
       for (const exp of found.value) {
-        const original = exp.type;
         const patch = afterPatch(exp, 'type', (args: SteamAny[], ret: SteamAny) => {
+          // A fiber that still holds this function after deinit (or under a newer patch) must
+          // render Steam's output untouched.
+          if (this.stopped) return ret;
           this.renders++;
           try {
             reportQamVisible(args?.[0]?.visible);
@@ -100,7 +117,8 @@ export class TabsHook {
           }
         });
         this.patches.push(patch);
-        this.swapMounted(original, exp.type);
+        this.patched.push(exp);
+        this.swapMounted(exp.type);
       }
       hook.ok(found.strategy, `${found.value.length} component(s) patched`);
     } catch (e) {
@@ -133,14 +151,19 @@ export class TabsHook {
     }
   }
 
-  /** A QAM that is already mounted keeps the old function until its fiber's type is swapped. */
-  private swapMounted(original: SteamAny, patched: SteamAny): void {
+  /**
+   * A QAM that is already mounted keeps the function it was rendered with until its fiber's type
+   * is swapped. Fibers are matched through the __deckyPatch chain, so one still holding a type
+   * from an earlier Remora instance (or another patcher) is found too.
+   */
+  private swapMounted(target: SteamAny): void {
     try {
       const root = rootFiber();
       if (!root) return;
-      for (const f of findFibers(root, (x) => x.type === original)) {
-        f.type = patched;
-        if (f.alternate) f.alternate.type = patched;
+      const base = chainBase(target);
+      for (const f of findFibers(root, (x) => typeof x.type === 'function' && x.type !== target && chainBase(x.type) === base)) {
+        f.type = target;
+        if (f.alternate) f.alternate.type = target;
       }
     } catch (e) {
       log.debug('mounted QAM swap skipped', e);
@@ -148,6 +171,7 @@ export class TabsHook {
   }
 
   deinit(): void {
+    this.stopped = true;
     for (const p of this.patches) {
       try {
         p.unpatch();
@@ -156,5 +180,8 @@ export class TabsHook {
       }
     }
     this.patches = [];
+    // point mounted QAM fibers back at what is left after the unpatch
+    for (const exp of this.patched) this.swapMounted(exp.type);
+    this.patched = [];
   }
 }
