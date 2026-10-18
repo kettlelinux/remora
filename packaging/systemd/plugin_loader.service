@@ -1,0 +1,19 @@
+# Remora, under Decky Loader's unit name: plugins restart and stop the loader as "plugin_loader".
+[Unit]
+Description=Remora (Steam Game Mode plugin loader, Decky compatible)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Restart=always
+RestartSec=1
+# SIGTERM to Remora, which stops each plugin (its _unload, then its process group); anything
+# still there when the timeout runs out is killed
+KillMode=mixed
+TimeoutStopSec=15
+ExecStart=/usr/lib/remora/remora-start
+Environment=LOG_LEVEL=INFO
+
+[Install]
+WantedBy=multi-user.target
