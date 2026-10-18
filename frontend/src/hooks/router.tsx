@@ -46,7 +46,8 @@ export class RouterState {
   getVersion = () => this.version;
 }
 
-const ROUTE_SRC = [/routePath:\w+\.match\?\.path\./, /routePath:null===\(/];
+// `routePath:x.match?.path` (current Steam passes it straight on), older `routePath:null===(...)`
+const ROUTE_SRC = [/routePath:[\w$]+\.match\?\.path\b/, /routePath:null===\(/];
 
 function findRouteComponent(): { value: SteamAny; strategy: string } | undefined {
   return runStrategies<SteamAny>(routeHook, [

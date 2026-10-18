@@ -70,3 +70,24 @@ export function findModule(test: (m: SteamAny) => boolean): SteamAny {
   }
   return undefined;
 }
+
+/** Exports of the modules whose factory source contains `text` (for code Steam doesn't export). */
+export function* modulesWithSource(text: string): Generator<SteamAny> {
+  const req = getRequire();
+  if (!req) return;
+  for (const [id, factory] of Object.entries<SteamAny>(req.m ?? {})) {
+    let src: string;
+    try {
+      src = String(factory);
+    } catch {
+      continue;
+    }
+    if (!src.includes(text)) continue;
+    try {
+      const exp = req(id);
+      if (exp) yield exp;
+    } catch {
+      // a module whose side effects fail
+    }
+  }
+}
