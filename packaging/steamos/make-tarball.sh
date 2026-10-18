@@ -30,6 +30,8 @@ if find "$root/site" -name '*.so' | grep -q .; then
   exit 1
 fi
 cp -r "$repo/backend/remora" "$root/site/"
+# the compat list (store/compat.py) is package data next to the code
+[ -f "$root/site/remora/data/compat.json" ] || { echo "make-tarball: no remora/data/compat.json" >&2; exit 1; }
 find "$root/site" -name __pycache__ -prune -exec rm -rf {} +
 install -m755 "$repo/packaging/remora-start" "$root/remora-start"
 install -m644 "$repo/packaging/systemd/plugin_loader.service" "$root/plugin_loader.service"

@@ -29,13 +29,15 @@ from urllib.parse import unquote, urlparse
 
 import aiohttp
 
+from .. import device
 from ..config import Config
 from ..plugins import manifest
 from ..plugins.manager import Entry, PluginManager
 from ..plugins.manifest import PluginInfo
 from ..settings import Settings
 from ..wsrouter import RouteError, WSRouter
-from . import archive
+from . import archive, elf
+from .compat import Compat, CompatList, blocked, refusal
 
 log = logging.getLogger("remora.store")
 
@@ -71,6 +73,7 @@ class InstallItem:
     compatible: bool = True
     incompatible_reason: str | None = None
     root: bool | None = None
+    compat: dict[str, Any] | None = None  # store/compat.py's answer for this version
 
     def prompt(self) -> dict[str, Any]:
         return {"name": self.name, "version": self.version, "hash": self.hash,
@@ -78,7 +81,7 @@ class InstallItem:
 
     def details(self) -> dict[str, Any]:
         return {**self.prompt(), "source": self.source, "signed": self.signed,
-                "compatible": self.compatible, "root": self.root}
+                "compatible": self.compatible, "root": self.root, "compat": self.compat}
 
 
 def _sha256_file(path: Path) -> str:
@@ -119,7 +122,8 @@ def _chown_root(path: Path) -> None:
 class Installer:
     def __init__(self, cfg: Config, settings: Settings, manager: PluginManager, ws: WSRouter,
                  session: Callable[[], aiohttp.ClientSession], ssl: Any,
-                 after_install: Callable[[InstallItem, bool], Awaitable[None]] | None = None) -> None:
+                 after_install: Callable[[InstallItem, bool], Awaitable[None]] | None = None,
+                 compat: Compat | None = None) -> None:
         self.cfg = cfg
         self.settings = settings
         self.manager = manager
@@ -127,6 +131,9 @@ class Installer:
         self._session = session
         self._ssl = ssl
         self.after_install = after_install
+        if compat is None:
+            compat = Compat(device.current(str(cfg.system_root)), CompatList())
+        self.compat = compat
         self.root_prompt_seconds = ROOT_PROMPT_SECONDS
         self.connect_timeout = CONNECT_TIMEOUT
         self.download_deadline = DOWNLOAD_DEADLINE
@@ -212,6 +219,24 @@ class Installer:
             raise InstallError(f"{entry.info.name} is part of the system image ({entry.info.path} is "
                                f"not a plugin folder Remora manages), so it can't be {action} here; "
                                "it changes with system updates")
+
+    async def _not_for_here(self, name: str, message: str) -> None:
+        """A plugin this device can't run: refused, or in developer mode installed with a
+        warning (remora/install_warning) the UI shows."""
+        if not self.developer:
+            raise InstallError(message)
+        log.warning("developer mode: installing anyway: %s", message)
+        await self.ws.emit("remora/install_warning", name, message)
+
+    def _binary_problem(self, path: Path, name: str, version: str) -> str | None:
+        """The install-time binary check (store/elf.py): used native code for another CPU."""
+        report = self.compat.folder(path)
+        for unread in report.unchecked:
+            log.info("%s: can't look inside %s; not checked for its CPU", name, unread)
+        foreign = report.foreign(self.compat.device.arch)
+        if not foreign:
+            return None
+        return f"{name} {version} does not work on this device: {elf.describe(foreign)}"
 
     # -- root prompt -------------------------------------------------------------------------
 
@@ -401,6 +426,8 @@ class Installer:
             raise InstallError("the store's signature for this version does not match; not installing")
         if not item.compatible and not self.developer:
             raise InstallError(f"this version does not fit this device: {item.incompatible_reason}")
+        if blocked(item.compat):
+            await self._not_for_here(item.name, refusal(item.name, item.version, item.compat or {}))
         existing = self.manager.plugins.get(item.name)
         if existing is not None:
             self._check_managed(existing, "updated")
@@ -445,6 +472,11 @@ class Installer:
                 raise InstallError(f"the zip holds a plugin called {info.name!r}, not {item.name!r}")
             log.info("developer install: %s is called %r", item.artifact, info.name)
             item.name = info.name
+        if dev_install:
+            # no store version to go by: what the lists say about the zip's own name and version
+            compat = self.compat.check(info.name, info.version)
+            if blocked(compat):
+                await self._not_for_here(info.name, refusal(info.name, info.version, compat))
 
         existing = self.manager.plugins.get(item.name)
         if existing is not None:
@@ -459,6 +491,9 @@ class Installer:
 
         await self._progress(80, "Remora.install.binaries")
         await self._remote_binaries(staged)
+        problem = await asyncio.to_thread(self._binary_problem, staged, info.name, info.version)
+        if problem is not None:
+            await self._not_for_here(info.name, problem)
         if self.cfg.running_as_root:
             await asyncio.to_thread(_chown_root, staged)
 
@@ -610,6 +645,14 @@ class Installer:
                 raise RouteError("ValueError", f"the kept folder holds {info.name!r}, not {name!r}")
             meta = self._read_prev_meta(target.name)
             source = meta.get("source") if isinstance(meta.get("source"), str) else None
+            compat = self.compat.check(name, info.version)
+            problem = refusal(name, info.version, compat) if blocked(compat) \
+                else await asyncio.to_thread(self._binary_problem, prev, name, info.version)
+            if problem is not None:
+                try:
+                    await self._not_for_here(name, problem)
+                except InstallError as e:
+                    raise RouteError("PermissionError", str(e)) from None
             if info.root and not self._root_ok(name, source):
                 if not await self._ask_root(info, source):
                     raise RouteError("PermissionError",

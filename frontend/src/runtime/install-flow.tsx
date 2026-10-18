@@ -12,6 +12,7 @@ import { useEffect, useState } from 'react';
 import { modalsUsable, showModal } from '../hooks/modal';
 import type { Toaster } from '../hooks/toaster';
 import { ConfirmModal, DialogButton, Focusable, ModalRoot } from '../hooks/components';
+import { compatText, isBlocked, type Compat } from '../ui/common/compat';
 import { t } from '../ui/i18n';
 import { WarningIcon } from '../ui/icons';
 import { useStore } from '../ui/react-utils';
@@ -46,6 +47,8 @@ export interface RequestDetail {
   signed: boolean | 'invalid' | 'self';
   compatible: boolean;
   root: boolean | null;
+  /** Remora's compat answer for this version (older backends: absent). */
+  compat?: Compat | null;
 }
 
 export interface Progress {
@@ -132,6 +135,10 @@ export class InstallFlow {
       if (this.failed.delete(n)) return;
       this.toaster.toast({ title: t('install.done', { name: n }), body: '' });
       this.onFinished(n);
+    });
+    // developer mode installed something the compat check rules out
+    on('remora/install_warning', (name, message) => {
+      this.toaster.toast({ title: t('install.warning', { name: String(name) }), body: String(message ?? ''), logo: <WarningIcon /> });
     });
     on('remora/install_failed', (name, message) => {
       this.failed.add(String(name));
@@ -297,6 +304,7 @@ export function promptBody(p: Prompt, details?: RequestDetail[]): string {
         else if (d.signed === 'self') lines.push(t('install.unsigned'), t('install.selfSigned'));
         else if (d.source) lines.push(t('install.unsigned'));
         if (!d.compatible) lines.push(t('install.incompatible'));
+        if (isBlocked(d.compat)) lines.push(t('install.compatBlocked'), compatText(d.compat) ?? '');
         if (d.root) lines.push(t('install.root'));
       }
       return lines.join('\n');

@@ -20,10 +20,13 @@ backend/remora/        the loader (Python 3.11+)
   compat/              the decky, decky_plugin, settings, helpers, localplatform, injector modules
   cdp.py               Steam's CEF devtools: injection, execute_in_tab
   fsutil.py            walking user-owned folders without following links
-  store/               the plugin store
+  store/               the plugin store; compat.py and elf.py: plugin compatibility
+  device.py            the device facts compat lists name
+  data/compat.json     the shipped compat list
 backend/tests/         pytest
 frontend/              TypeScript injected into Steam; built into backend/remora/static
 sdk/                   decky.pyi and the plugin developer guide
+tools/compat-scan.py   scans a Decky store for plugins that can't run on ARM (see below)
 packaging/             systemd unit, start script, Arch PKGBUILD, SteamOS installer
 ```
 
@@ -126,6 +129,23 @@ sudo -E .venv/bin/remora serve                       # or without sudo: everythi
 ```
 
 `sudo systemctl start plugin_loader` puts the installed one back.
+
+## Compat lists
+
+`tools/compat-scan.py` reads the newest version of every plugin in a Decky-format store, in
+memory (nothing is unpacked or run; `.py` files are only parsed), and writes `requires`
+entries for used x86-only native code, x86-only `remote_binary` downloads and Python imports
+nothing provides, with `upto` set to the scanned version. It merges into an existing list and
+keeps hand-written fields; the `scan` record in each entry is what it wrote last time.
+
+```sh
+python3 -I tools/compat-scan.py -o new-compat.json --zips ~/store-zips   # downloads into --zips
+python3 -I tools/compat-scan.py -o new-compat.json --merge backend/remora/data/compat.json \
+    --offline --plugins plugins.json --zips ~/store-zips                  # no network
+```
+
+Review the result before it goes into `backend/remora/data/compat.json`: the "used" rule for
+binaries is a heuristic (the file name appearing in the plugin's code), and so are imports.
 
 ## Packaging
 

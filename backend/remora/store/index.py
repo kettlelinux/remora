@@ -19,6 +19,7 @@ from urllib.parse import unquote, urljoin, urlparse
 
 import aiohttp
 
+from ..device import normalize_machine
 from .sources import DECKY_CDN, StoreSource
 
 log = logging.getLogger("remora.store")
@@ -73,14 +74,14 @@ def is_newer(remote: str | None, installed: str | None) -> bool:
 
 
 def machine_arch() -> str:
-    m = platform.machine().lower()
-    return {"arm64": "aarch64", "amd64": "x86_64"}.get(m, m)
+    return normalize_machine(platform.machine())
 
 
-def compatible(version: dict[str, Any], decky_version: str) -> tuple[bool, str | None]:
-    arch = version.get("arch")
-    if isinstance(arch, list) and arch and "any" not in arch and machine_arch() not in arch:
-        return False, f"built for {', '.join(map(str, arch))}, this device is {machine_arch()}"
+def compatible(version: dict[str, Any], decky_version: str,
+               arch_here: str | None = None) -> tuple[bool, str | None]:
+    arch, here = version.get("arch"), arch_here or machine_arch()
+    if isinstance(arch, list) and arch and "any" not in arch and here not in arch:
+        return False, f"built for {', '.join(map(str, arch))}, this device is {here}"
     min_loader = version.get("min_loader")
     if isinstance(min_loader, str):
         need, have = parse_version(min_loader), parse_version(decky_version)
@@ -191,8 +192,10 @@ def source_problem(source: StoreSource, developer: bool) -> str | None:
 
 class Fetcher:
     def __init__(self, session_factory: Any, ssl: Any, decky_version: str,
-                 developer: Callable[[], bool] = lambda: False) -> None:
+                 developer: Callable[[], bool] = lambda: False,
+                 arch: Callable[[], str] = machine_arch) -> None:
         self._session = session_factory
+        self.arch = arch  # the device's CPU, for index versions' `arch`
         self._ssl = ssl
         self.decky_version = decky_version
         self.developer = developer
@@ -362,7 +365,7 @@ class Fetcher:
                 # no fallback to anyone's CDN: an index names its own zips (compat/store.md §6.2)
                 v["artifact"] = urljoin(url, artifact) if isinstance(artifact, str) and artifact else None
                 v["signed"] = check_signature(keys, plugin["name"], v, pinned)
-                ok, why = compatible(v, self.decky_version)
+                ok, why = compatible(v, self.decky_version, self.arch())
                 v["compatible"] = ok
                 if why:
                     v["incompatible_reason"] = why

@@ -12,6 +12,8 @@ from . import DECKY_COMPAT_VERSION, __version__
 
 
 DEFAULT_CONTROL_SOCKET = "/run/remora/control.sock"
+# extra compat lists (store/compat.py), after the one in the package; later ones win per plugin
+DEFAULT_COMPAT_PATHS = ["/usr/share/remora/compat.d/*.json", "/etc/remora/compat.d/*.json"]
 
 
 def _flag(name: str, default: bool) -> bool:
@@ -79,6 +81,11 @@ class Config:
     control_socket: Path | None = None
     input_sysfs: Path = Path("/sys/class/input")
     input_dev: Path = Path("/dev/input")
+    # REMORA_COMPAT (`:`-separated files, globs or folders of *.json): compat lists read after the
+    # package's own data/compat.json
+    compat_paths: list[str] = field(default_factory=lambda: list(DEFAULT_COMPAT_PATHS))
+    # where device facts (device.py) are read from: /proc, /sys, /etc/os-release, /usr/bin
+    system_root: Path = Path("/")
 
     @property
     def plugins_dir(self) -> Path:
@@ -121,4 +128,6 @@ class Config:
             confirm_command=os.environ.get("REMORA_CONFIRM_COMMAND", "").strip(),
             confirm_keys=os.environ.get("REMORA_CONFIRM_KEYS", "").split(),
             control_socket=Path(control) if control else None,
+            compat_paths=[p for p in os.environ["REMORA_COMPAT"].split(":") if p]
+            if "REMORA_COMPAT" in os.environ else list(DEFAULT_COMPAT_PATHS),
         )

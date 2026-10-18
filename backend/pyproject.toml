@@ -28,7 +28,7 @@ remora = "remora.cli:main"
 include = ["remora*"]
 
 [tool.setuptools.package-data]
-remora = ["compat/*.py", "static/**/*", "locales/*.json"]
+remora = ["compat/*.py", "static/**/*", "locales/*.json", "data/*.json"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

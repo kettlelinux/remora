@@ -51,6 +51,15 @@ g.WebSocket = class {
       case 'remora/status': return reply({ version: '0.1', deckyVersion: '3.2', plugins: [] });
       case 'loader/call_legacy_plugin_method': return reply({ success: true, result: 42 });
       case 'loader/call_plugin_method': return setTimeout(() => this.onmessage?.({ data: JSON.stringify({ type: -1, id: m.id, error: { name: 'ValueError', message: 'bad', traceback: 'tb' } }) }), 1);
+      case 'remora/device': return reply({ arch: 'aarch64', model: 'AYN Odin 2 Portal', device_id: 'ayn,odin2portal', cpu_vendor: 'qualcomm', gpu_drivers: ['msm_dpu'], facts: { aarch64: true, 'adreno-gpu': true } });
+      case 'remora/store/list': {
+        const v = (name, compat) => ({ name, source: 'decky', versions: [{ name: '1.0.0', hash: 'h' + name, artifact: 'https://x/' + name, compat }], compat });
+        return reply({ sources: [{ id: 'decky', ok: true }], plugins: [
+          v('Works Plug', { state: 'works', reasons: [], note: 'Fine here.', checked: null, tested_here: true }),
+          v('X86 Plug', { state: 'unsupported', reasons: ['x86_64', 'amd-cpu'], note: 'Ships a PC backend.', checked: '1.0.0' }),
+          v('Plain Plug', { state: 'untested', reasons: [], note: null, checked: null }),
+        ] });
+      }
       case 'remora/never': return;
       default: return reply(null);
     }
@@ -209,7 +218,20 @@ for (const path of ['/decky/settings', '/decky/store', '/remora/plugin/:name']) 
 check(renderErrors.length === 0, 'no render errors: ' + renderErrors.join(' | '));
 console.log('statuses:', JSON.stringify(g.remora.hooks().map((h) => [h.id, h.state, h.strategy ?? h.detail])));
 console.log('console errors:', errors.length);
-setTimeout(() => {
+setTimeout(async () => {
+  // the store, mounted again now that the socket is back (the fake answers no FULL_SYNC):
+  const storeView = await tryRender('/decky/store after the reconnect', React.createElement(L.routerHook.routerState.routes.get('/decky/store').component));
+  // compat badges, the device line, and unsupported plugins hidden until the toggle
+  const text = () => storeView.div.textContent;
+  check(text().includes('Works Plug') && text().includes('Untested') && text().includes('Tested on this device') && !text().includes('X86 Plug'), 'store hides unsupported plugins and shows badges');
+  check(text().includes('AYN Odin 2 Portal · Qualcomm ARM64 · Adreno graphics') && text().includes('1 plugin(s) for other hardware hidden'), 'store shows the device and the hidden count: ' + text().slice(0, 160));
+  await act(async () => { await L.settings.set('remora.storeShowIncompatible', true); await new Promise((res) => setTimeout(res, 20)); });
+  check(sent.some((m) => m.route === 'remora/settings/set' && m.args[0] === 'remora.storeShowIncompatible' && m.args[1] === true), 'storeShowIncompatible goes through remora/settings/set');
+  check(text().includes('X86 Plug') && text().includes('Not for this device') && text().includes('Needs an x86_64 (PC) processor, an AMD processor.'), 'the toggle shows them with the reason');
+  const disabled = [...storeView.div.querySelectorAll('button')].filter((b) => b.textContent === 'Install' && b.disabled);
+  check(disabled.length === 1, 'the unsupported plugin cannot be installed without developer mode');
+  await act(async () => { await L.settings.set('developer.enabled', true); await new Promise((res) => setTimeout(res, 20)); });
+  check(text().includes('Install anyway (developer mode)'), 'developer mode offers install anyway with a warning');
   const fs = sent.find((m) => m.type === 4);
   check(fs && fs.messages.some((m) => m.route === 'remora/never'), 'reconnect resends pending in FULL_SYNC');
   // the resync after the reconnect: Legacy (unloaded above) is back, Slow/Hang (not listed) are gone

@@ -10,10 +10,12 @@ from typing import Any
 import aiohttp
 from yarl import URL
 
+from .. import device as device_mod
 from ..config import Config
 from ..plugins.manager import PluginManager
 from ..settings import Settings
 from ..wsrouter import RouteError, WSRouter
+from .compat import Compat, CompatList, blocked
 from .index import Fetcher, Listing, SourceError, is_newer
 from .install import INSTALL_SOURCE, InstallItem, Installer
 from .sources import Sources, StoreSource
@@ -51,10 +53,13 @@ class StoreService:
         self.sources = Sources(settings)
         self._ssl = ssl_context()
         self._http: aiohttp.ClientSession | None = None
+        self.compat = Compat(device_mod.current(str(cfg.system_root)), CompatList.load(cfg.compat_paths))
         self.fetcher = Fetcher(self.session, self._ssl, cfg.decky_version,
-                               developer=lambda: bool(settings.get("developer.enabled")))
+                               developer=lambda: bool(settings.get("developer.enabled")),
+                               arch=lambda: self.compat.device.arch)
         self.installer = Installer(cfg, settings, manager, ws, self.session, self._ssl,
-                                   after_install=self._telemetry)
+                                   after_install=self._telemetry, compat=self.compat)
+        manager.compat_of = lambda info: self.compat.installed(info.name, info.version, info.path)
         # before the plugin manager loads anything: undo what a crash cut short
         self.installer.recover()
         self._requests: dict[str, list[InstallItem]] = {}
@@ -80,6 +85,7 @@ class StoreService:
             "remora/store/answer_root": self.answer_root,
             "remora/store/rollback": self.rollback,
             "remora/store/previous": self.previous,
+            "remora/device": self.device,
         }
         for name, fn in routes.items():
             ws.add_route(name, fn)
@@ -103,6 +109,9 @@ class StoreService:
         result = self.sources.set(sources)
         self.fetcher.clear()
         return [s.to_json() for s in result]
+
+    async def device(self) -> dict[str, Any]:
+        return {**self.compat.device.to_json(), "compat_lists": list(self.compat.lists.files)}
 
     # -- listing -----------------------------------------------------------------------------
 
@@ -132,6 +141,9 @@ class StoreService:
                 plugins += [p for p in listing.plugins if p.get("visible", True) is not False]
         if query:
             plugins = [p for p in plugins if _matches(p, query)]
+        # all of them, with `compat`: the UI hides unsupported and broken ones unless
+        # remora.storeShowIncompatible is on
+        self.compat.annotate(plugins)
         sort_by = sort_by if sort_by in SORT_KEYS else "name"
         plugins.sort(key=_sort_key(sort_by), reverse=sort_direction == "desc")
         return {"sources": status, "plugins": plugins}
@@ -170,6 +182,7 @@ class StoreService:
         order = [s.id for s in sources]
         recorded = self.settings.get(INSTALL_SOURCE) or {}
         frozen = set(self.settings.get("frozenPlugins") or [])
+        developer = bool(self.settings.get("developer.enabled"))
         result: dict[str, dict[str, Any]] = {}
         for name, entry in self.manager.plugins.items():
             if name in frozen or not self.installer.managed(entry.info):
@@ -181,7 +194,9 @@ class StoreService:
                 remote = maps.get(source_id, {}).get(name)
                 if remote is None:
                     continue
-                if is_newer(remote[0], entry.info.version):
+                # an update this device can't run is no update (developer mode still offers it)
+                if is_newer(remote[0], entry.info.version) \
+                        and (developer or not blocked(self.compat.check(name, remote[0]))):
                     result[name] = {"version": remote[0], "hash": remote[1], "artifact": remote[2],
                                     "source": source_id}
                 break
@@ -218,11 +233,14 @@ class StoreService:
             item.size = version.get("size") if isinstance(version.get("size"), int) else None
             item.compatible = bool(version.get("compatible", True))
             item.incompatible_reason = version.get("incompatible_reason")
+            item.compat = self.compat.check(item.name, item.version, version.get("arch"))
             flags = version.get("flags")
             if isinstance(flags, list):
                 item.root = "root" in flags
             elif "root" in (plugin.get("tags") or []):
                 item.root = True
+        else:
+            item.compat = self.compat.check(item.name, item.version)
         return item
 
     async def _emit_details(self, request_id: str, items: list[InstallItem]) -> None:

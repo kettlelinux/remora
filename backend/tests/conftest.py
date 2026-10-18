@@ -90,6 +90,7 @@ def cfg(home: Path) -> Config:
         terminal_timeout=5.0,
         input_sysfs=home / "no-sysfs",
         input_dev=home / "no-dev",
+        compat_paths=[],  # never the workstation's /etc/remora/compat.d
     )
 
 

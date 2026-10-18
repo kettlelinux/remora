@@ -41,7 +41,8 @@ package() {
     --platform any --platform manylinux2014_x86_64 \
     --target "$site" -r packaging/requirements.txt
   rm -rf "$site/bin"
-  cp -r backend/remora "$site/"
+  cp -r backend/remora "$site/"   # with data/compat.json, the shipped compat list
+  test -f "$site/remora/data/compat.json"
   find "$site" -name __pycache__ -prune -exec rm -rf {} +
   python -m compileall -q -d "/$_site" "$site"
 

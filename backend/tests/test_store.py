@@ -236,7 +236,8 @@ def make_cfg(tmp_path: Path) -> Config:
     (homebrew / "plugins").mkdir(parents=True)
     (homebrew / "settings").mkdir(parents=True)
     return Config(user=me.pw_name, uid=me.pw_uid, gid=me.pw_gid, user_home=home, homebrew=homebrew,
-                  privileged=homebrew, live_reload=False, inject=False, stop_timeout=3.0)
+                  privileged=homebrew, live_reload=False, inject=False, stop_timeout=3.0,
+                  compat_paths=[])
 
 
 class Env:

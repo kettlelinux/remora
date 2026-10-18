@@ -30,7 +30,7 @@ the init hook and the legacy ServerAPI.
 
 | Route | Args | Result |
 |---|---|---|
-| `loader/get_plugins` | | `[{name, version, load_type, disabled}]` in `pluginOrder`, then load order |
+| `loader/get_plugins` | | `[{name, version, load_type, disabled, compat}]` in `pluginOrder`, then load order (`compat`: Remora's, see "Plugin compatibility") |
 | `loader/reload_plugin` | `name` | `null`; the frontend then gets `loader/import_plugin` |
 | `loader/call_plugin_method` | `name, method, ...args` | the return value; rejects on a Python exception |
 | `loader/call_legacy_plugin_method` | `name, method, kwargs` | `{success, result}`; never rejects (errors, a stopped plugin, bad kwargs: `success: false`) |
@@ -80,7 +80,8 @@ Events (EVENT `event`, `args`):
 | `remora/permissions/list` | | `[{name, root, approved, source}]` for plugins that ask for root |
 | `remora/permissions/set` | `name, approved` | `false`: revokes at once and stops the plugin, `{approved: false}`. `true`: asks for physical confirmation (blocks until confirmed or timed out), `{approved: bool, reason?}`, and starts the plugin when confirmed |
 | `remora/permissions/confirm_mode` | `name?` | `{mode: "keys" \| "command" \| "terminal", hint}` |
-| `remora/settings/set` | `key, value` | value; only `remora.storeTelemetry` and `remora.verbose` (booleans), anything else is ERROR `PermissionError` |
+| `remora/settings/set` | `key, value` | value; only `remora.storeTelemetry`, `remora.verbose`, `remora.storeShowIncompatible` and `developer.enabled` (booleans), anything else is ERROR `PermissionError` |
+| `remora/device` | | `{arch, model, device_id, cpu_vendor, gpu_drivers, facts: {<fact>: bool}, compat_lists: [{path, updated, plugins}]}` |
 | `remora/store/sources` | | `[StoreSource]` |
 | `remora/store/set_sources` | `[StoreSource]` | `[StoreSource]` |
 | `remora/store/list` | `sort_by?, sort_direction?, query?` | `{sources: [{id, ok, error?}], plugins: [StorePlugin]}` |
@@ -96,7 +97,8 @@ PluginStatus = {
                                             // | "disabled" | "passive" | "blocked" (root not approved)
   restarts,                                 // crash restarts since the loader started
   error,                                    // last error text or null
-  root, approved                            // asks for root; the user allowed it
+  root, approved,                           // asks for root; the user allowed it
+  compat                                    // Compat (below)
 }
 StoreSource = { id, name, kind: "decky" | "index", url, enabled, builtin }
 StorePlugin = Decky's store entry ({id, name, author, description, tags, image_url,
@@ -112,7 +114,8 @@ Remora events:
 | `remora/confirm_waiting` | `request_id \| null, name, mode, hint, until`: the backend waits for physical confirmation until `until` (epoch seconds). Show the hint and a countdown; Cancel only closes the UI. |
 | `remora/confirm_done` | `request_id \| null, name, ok` |
 | `remora/install_failed` | `name, message` |
-| `remora/install_request` | `request_id, [{name, version, hash, install_type, source, signed, compatible, root}]`: sent right after `loader/add_plugin_install_prompt` / `loader/add_multiple_plugins_install_prompt`, with what the store knows about each zip (matched by name + hash; `source: null` when no enabled source lists it, `root: null` when unknown). |
+| `remora/install_warning` | `name, message`: developer mode installs (or rolls back to) a version the compat check rules out; the install goes on |
+| `remora/install_request` | `request_id, [{name, version, hash, install_type, source, signed, compatible, root, compat}]`: sent right after `loader/add_plugin_install_prompt` / `loader/add_multiple_plugins_install_prompt`, with what the store knows about each zip (matched by name + hash; `source: null` when no enabled source lists it, `root: null` when unknown). |
 
 ## Store details
 
@@ -161,9 +164,69 @@ Remora events:
 - `remora/root_prompt` uses its own `request_id`, not the install request's.
 - Settings keys: `remora.storeSources` (`[StoreSource]`), `remora.installSource` (`{name: source id}`),
   `remora.storeTelemetry` (bool, default false: Decky's install counter POST, to `decky` sources
-  only), `remora.verbose` (bool, the UI's extra logging), `remora.rootApproved`
+  only), `remora.verbose` (bool, the UI's extra logging), `remora.storeShowIncompatible` (bool,
+  default false: the store lists plugins for other hardware too), `remora.rootApproved`
   (`[{name, source}]`; the old list of names reads as approvals of each plugin's recorded source).
   Uninstall also drops the plugin's root approval and its kept previous version.
+
+## Plugin compatibility
+
+Lists: `remora-compat/1` files. The package's `backend/remora/data/compat.json` first, then
+`REMORA_COMPAT` (`:`-separated files, globs or folders of `*.json`; default
+`/usr/share/remora/compat.d/*.json` then `/etc/remora/compat.d/*.json`). Later files override
+earlier ones per plugin name, field by field; `"Name": null` drops the entry. A missing, broken
+or wrong-format file is logged and skipped; a bad field is dropped; an entry left with neither
+`requires` nor `status` is ignored. Other fields (the scanner's `scan`) are ignored.
+
+```
+{"format": "remora-compat/1", "updated": "2026-10-18", "plugins": {
+  "<store plugin name>": {requires?: [fact], status?: "works" | "partial" | "broken",
+                          tested?: [device id], upto?: version | null, note?: str}}}
+```
+
+Facts (`device.py`, read once at startup): `x86_64`, `aarch64` (the CPU); `steamdeck` (DMI
+`Valve` + `Jupiter`/`Galileo`); `amd-cpu`, `intel-cpu` (`/proc/cpuinfo` vendor_id),
+`qualcomm-cpu` (a devicetree compatible starts with `qcom,`); `amd-gpu`, `intel-gpu`,
+`adreno-gpu`, `mali-gpu` (a `/sys/class/drm/card*/device/driver` named amdgpu; i915 or xe; msm,
+msm_dpu or msm_drm; panfrost, panthor, mali or mali_kbase); `flatpak`, `pacman`
+(`/usr/bin/<name>` exists); `steamos` (os-release `ID=steamos`); `systemd`
+(`/run/systemd/system`); `deck-user` (a user named `deck` in /etc/passwd) and `deck-home`
+(`/home/deck` is a folder), for plugins that hardcode SteamOS's user or home; `python:<module>` (the top-level module is importable by a plugin
+host: Remora's interpreter and sys.path with the compat folder, without the plugin's
+py_modules; found with importlib's path finder, nothing is imported; cached). An unknown fact
+name is logged once and ignored. Device ids for `tested`: every devicetree compatible, or
+`dmi:<vendor>:<product>` and `<vendor>:<product>`.
+
+```
+Compat = {state: "works" | "partial" | "untested" | "unsupported" | "broken",
+          reasons: [fact],          // unmet requires (for "untested": what it may need)
+          note: str | null, checked: version | null,   // the entry's note and upto
+          tested_here?: bool,       // `tested` names this device
+          binaries?: [path], detail?: str}   // installed plugins: used native files for
+                                             // another CPU, "built for x86_64 only: bin/x"
+```
+
+- A version newer than `upto` is `untested` (requires not enforced, still listed in `reasons`).
+  Within `upto`: unmet requires → `unsupported`, else `status` (`broken`, `works`, `partial`),
+  else `untested`. An index version's `arch` without this CPU → `unsupported` with the arch
+  list as `reasons`.
+- `remora/store/list`: every plugin and each of its versions carries `compat` (the plugin's is
+  its newest installable version's). The UI hides `unsupported` and `broken` plugins unless
+  `remora.storeShowIncompatible` (bool, default false) is on.
+- Install, update and rollback of an `unsupported`/`broken` version are refused
+  (`remora/install_failed`, or RouteError `PermissionError` for rollback) unless developer mode
+  is on, which installs with `remora/install_warning`. `remora/store/updates` leaves such
+  versions out unless developer mode is on.
+- Binary check, after unpacking and after `remote_binary` downloads (and on the kept version
+  before a rollback): ELF files whose `e_machine` this CPU can't run, that the plugin uses (in
+  `py_modules/`, a Python extension, a `remote_binary` or a member of one that is a tar or zip,
+  or named in the plugin's `.py`/`.sh` files), refuse the install the same way, list or no
+  list. A build for this CPU at the same path with the arch name swapped (`bin/x86_64/tool` vs
+  `bin/aarch64/tool`), or a `.py` next to a Python extension, excuses it. Windows `.exe`/`.dll`
+  files are not ELF and don't count. Nothing is run or unpacked for this; archive members are
+  read in memory (at most 20000 members, 2 GiB).
+- Installed plugins (`loader/get_plugins`, `PluginStatus`): the list's answer for the installed
+  version plus the binary check of its folder (cached until the folder changes).
 
 ## Root approval
 

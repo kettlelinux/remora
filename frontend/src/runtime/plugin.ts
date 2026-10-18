@@ -1,5 +1,6 @@
 // Plugin shapes: what a plugin factory returns, and what Remora keeps for each loaded plugin.
 import type { ReactNode } from 'react';
+import type { Compat } from '../ui/common/compat';
 
 export const LOAD_LEGACY = 0;
 export const LOAD_ESM = 1;
@@ -31,6 +32,8 @@ export interface InstalledPlugin {
   version?: string;
   load_type: number;
   disabled: boolean;
+  /** Remora: whether it can work on this device (lists plus its binaries). */
+  compat?: Compat;
 }
 
 export interface QueuedImport {

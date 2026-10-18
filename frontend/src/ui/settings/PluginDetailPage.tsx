@@ -4,6 +4,7 @@ import { ButtonItem, Field, Focusable, PanelSection, PanelSectionRow } from '../
 import { navigateBack } from '../../hooks/navigation';
 import type { PluginLoader } from '../../runtime/plugin-loader';
 import { errorText } from '../../util/errors';
+import { CompatBadge, compatText, isBlocked } from '../common/compat';
 import { ConfirmButton } from '../common/ConfirmButton';
 import { t } from '../i18n';
 import { useStore } from '../react-utils';
@@ -80,6 +81,18 @@ export function PluginDetailPage({ loader }: { loader: PluginLoader }) {
         <Field label={t('plugins.state', { state: p.disabled ? 'disabled' : st.state })} focusable description={st.error ?? undefined}>
           {t('plugins.restarts', { count: st.restarts })}
         </Field>
+      )}
+      {p.compat && (
+        <Field
+          label={
+            <span style={{ display: 'flex', alignItems: 'center' }}>
+              {t('compat.installedTitle')}
+              <CompatBadge compat={p.compat} />
+            </span>
+          }
+          focusable
+          description={[isBlocked(p.compat) ? t('compat.installedBad') : '', compatText(p.compat) ?? ''].filter(Boolean).join(' ') || undefined}
+        />
       )}
       {error && <p style={{ color: '#ff6b6b' }}>{error}</p>}
       <PanelSection title={t('plugins.actions')}>
