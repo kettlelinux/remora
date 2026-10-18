@@ -8,7 +8,7 @@ import errno
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterator
+from typing import Any, AsyncIterator, Callable, Iterator
 
 from ..config import Config
 from ..confirm import ConfirmService
@@ -48,6 +48,8 @@ class PluginManager:
         self.watch_error: OSError | None = None  # why live reload isn't watching
         self._locks: dict[str, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
+        # the store's compat answer for an installed plugin (store/compat.py), set by the store
+        self.compat_of: Callable[[PluginInfo], dict[str, Any]] | None = None
 
     # -- per-plugin lifecycle lock -----------------------------------------------------------
 
@@ -300,7 +302,17 @@ class PluginManager:
         rank = {name: i for i, name in enumerate(order)}
         entries = sorted(self.plugins.values(), key=lambda e: rank.get(e.info.name, len(rank)))
         return [{"name": e.info.name, "version": e.info.version, "load_type": e.info.load_type,
-                 "disabled": self.disabled(e.info.name)} for e in entries]
+                 "disabled": self.disabled(e.info.name), **self._compat(e.info)} for e in entries]
+
+    def _compat(self, info: PluginInfo) -> dict[str, Any]:
+        """{"compat": ...} for get_plugins and status, or nothing when the store can't say."""
+        if self.compat_of is None:
+            return {}
+        try:
+            return {"compat": self.compat_of(info)}
+        except Exception:
+            log.exception("compat check of %s failed", info.name)
+            return {}
 
     def status(self, name: str) -> dict[str, Any]:
         entry = self.plugins[name]
@@ -317,6 +329,7 @@ class PluginManager:
             "name": name, "dir": info.dir_name, "version": info.version, "loadType": info.load_type,
             "state": state, "restarts": entry.proc.restarts if entry.proc else 0, "error": error,
             "root": info.root, "approved": (not info.root) or self.root_approved(name),
+            **self._compat(info),
         }
 
     def statuses(self) -> list[dict[str, Any]]:

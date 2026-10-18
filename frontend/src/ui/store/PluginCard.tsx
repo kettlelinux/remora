@@ -6,6 +6,7 @@ import type { InstalledPlugin } from '../../runtime/plugin';
 import { errorText } from '../../util/errors';
 import { t, type StringKey } from '../i18n';
 import { WarningIcon } from '../icons';
+import { CompatBadge, compatText, isBlocked, type Compat } from '../common/compat';
 
 export interface StoreVersion {
   name: string;
@@ -16,6 +17,7 @@ export interface StoreVersion {
   signed?: boolean | 'invalid' | 'self';
   compatible?: boolean;
   incompatible_reason?: string;
+  compat?: Compat;
 }
 
 export interface StorePlugin {
@@ -27,6 +29,8 @@ export interface StorePlugin {
   image_url?: string;
   versions: StoreVersion[];
   source: string;
+  /** For the version an install picks by default. */
+  compat?: Compat;
 }
 
 // Install types: 0 install, 1 reinstall, 2 update, 3 downgrade, 4 overwrite. `versions` is newest first.
@@ -47,6 +51,9 @@ export function PluginCard({ plugin, sourceName, installed, backend, developer }
   const version = plugin.versions[vi];
   const type = installType(plugin, vi, installed);
   const root = plugin.tags?.includes('root');
+  const compat = version?.compat ?? plugin.compat;
+  const notHere = isBlocked(compat);
+  const compatLine = compatText(compat);
   // The backend refuses these too; the button says why instead of failing later.
   const blocked = !version
     ? t('store.empty')
@@ -57,6 +64,8 @@ export function PluginCard({ plugin, sourceName, installed, backend, developer }
         : version.compatible === false && !developer
           ? t('store.incompatible', { reason: version.incompatible_reason ?? '?' })
           : undefined;
+  // not for this device: the compat line says why; developer mode installs anyway
+  const disabled = Boolean(blocked) || (notHere && !developer);
 
   const install = async () => {
     if (!version) return;
@@ -74,7 +83,10 @@ export function PluginCard({ plugin, sourceName, installed, backend, developer }
         <img src={plugin.image_url} alt="" loading="lazy" style={{ width: 200, height: 125, objectFit: 'cover', borderRadius: 4, flexShrink: 0, background: 'rgba(255,255,255,0.05)' }} />
       )}
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ fontSize: 18, fontWeight: 700 }}>{plugin.name}</div>
+        <div style={{ fontSize: 18, fontWeight: 700, display: 'flex', alignItems: 'center', flexWrap: 'wrap' }}>
+          {plugin.name}
+          <CompatBadge compat={compat} />
+        </div>
         <div style={{ fontSize: 12, opacity: 0.7 }}>
           {plugin.author && t('store.by', { author: plugin.author })} · {sourceName}
           {installed && ` · ${t('store.installed', { version: installed.version ?? '?' })}`}
@@ -88,10 +100,16 @@ export function PluginCard({ plugin, sourceName, installed, backend, developer }
         )}
         {version?.signed === true && <div style={{ fontSize: 12, color: '#59bf40' }}>{t('store.signed')}</div>}
         {version?.signed === 'self' && <div style={{ fontSize: 12, opacity: 0.7 }}>{t('store.selfSigned')}</div>}
+        {compatLine && <div style={{ fontSize: 12, margin: '4px 0', color: notHere ? '#ff6b6b' : compat?.state === 'partial' ? '#e5a50a' : undefined, opacity: notHere ? 1 : 0.8 }}>{compatLine}</div>}
+        {notHere && developer && (
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 12, color: '#e5a50a', margin: '4px 0' }}>
+            <WarningIcon size={14} /> {t('compat.devWarning')}
+          </div>
+        )}
         {blocked && <div style={{ fontSize: 12, color: '#e5a50a' }}>{blocked}</div>}
         <Focusable style={{ display: 'flex', gap: 8, marginTop: 8 }} flow-children="horizontal">
-          <DialogButton style={{ flex: 1, minWidth: 0 }} disabled={Boolean(blocked)} onClick={() => void install()}>
-            {t(LABEL[type] ?? 'store.install')}
+          <DialogButton style={{ flex: 1, minWidth: 0 }} disabled={disabled} onClick={() => void install()}>
+            {notHere && developer ? t('compat.installAnyway') : t(LABEL[type] ?? 'store.install')}
           </DialogButton>
           {plugin.versions.length > 1 && (
             <div style={{ flex: '0 0 160px' }}>

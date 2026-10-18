@@ -136,6 +136,14 @@ Kettle's welcome plugin read them (survey §8).
   settings (store §2).
 - **`arch` and `min_loader`** in the index stop ARM devices from installing x86_64-only
   plugins.
+- **Compatibility.** The Decky store says nothing about CPUs or hardware, so Remora ships a
+  `remora-compat/1` list (`backend/remora/data/compat.json`, distro overlays in
+  `compat.d/`) that names what each plugin needs (`x86_64`, `steamdeck`, `python:<module>`,
+  ...), checked against the device's facts (`device.py`). Plugins that can't work here are
+  hidden and refused unless the user asks; an install-time check of the zip's ELF files
+  (`store/elf.py`) refuses used native code for another CPU whatever the list says.
+  `tools/compat-scan.py` builds list entries from a scan of the store (PROTOCOL.md, "Plugin
+  compatibility").
 - **Telemetry** (install counters) is off unless the user turns it on.
 - **The `X-Decky-Version` header** sent to the Decky source is configurable, and a 426 response
   shows a clear message instead of an empty store.

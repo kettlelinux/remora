@@ -10,6 +10,7 @@ import { openPage } from '../../hooks/navigation';
 import { orderPlugins } from '../../runtime/ordering';
 import type { PluginLoader } from '../../runtime/plugin-loader';
 import { statusBadges } from '../common/badges';
+import { CompatBadge } from '../common/compat';
 import { t } from '../i18n';
 import { useStore } from '../react-utils';
 
@@ -31,6 +32,7 @@ function EntryLabel({ name, version, disabled }: { name: string; version?: strin
   const statuses = useStore(loader.status.plugins);
   const updates = useStore(loader.updates.available);
   const loaded = useStore(loader.plugins);
+  const compat = useStore(loader.installed).find((p) => p.name === name)?.compat;
   return (
     <span style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap' }}>
       {name}
@@ -40,6 +42,7 @@ function EntryLabel({ name, version, disabled }: { name: string; version?: strin
         update: Boolean(updates[name]),
         loadError: Boolean(loaded.find((l) => l.name === name)?.loadError),
       })}
+      {compat && compat.state !== 'untested' && <CompatBadge compat={compat} />}
       {settings.hiddenPlugins.includes(name) && <span style={{ opacity: 0.6, marginLeft: 8, fontSize: 12 }}>{t('plugins.hidden')}</span>}
       {settings.frozenPlugins.includes(name) && <span style={{ opacity: 0.6, marginLeft: 8, fontSize: 12 }}>{t('plugins.frozen')}</span>}
     </span>

@@ -377,6 +377,12 @@ async def test_settings_routes(cfg: Config, settings, ws) -> None:
     with pytest.raises(RouteError):
         await utilities.set_remora_setting("remora.verbose", "yes")
     assert settings.get("remora.storeTelemetry") is True
+    assert await utilities.set_remora_setting("remora.storeShowIncompatible", True) is True
+    assert settings.get("remora.storeShowIncompatible") is True
+    with pytest.raises(RouteError):
+        await utilities.set_remora_setting("remora.storeShowIncompatible", 1)
+    with pytest.raises(RouteError):
+        await utilities.set_setting("remora.storeShowIncompatible", False)
     await utilities.close()
 
 

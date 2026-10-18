@@ -1,9 +1,10 @@
 // /decky/store (and /remora/store): plugins from every enabled source.
 import { useEffect, useMemo, useState } from 'react';
-import { Dropdown, Field, Focusable, PanelSection, PanelSectionRow, SteamSpinner, TextField } from '../../hooks/components';
+import { Dropdown, Field, Focusable, PanelSection, PanelSectionRow, SteamSpinner, TextField, ToggleField } from '../../hooks/components';
 import { PluginBoundary } from '../../hooks/error-boundary';
 import type { PluginLoader } from '../../runtime/plugin-loader';
 import { errorText } from '../../util/errors';
+import { deviceText, isBlocked, type DeviceInfo } from '../common/compat';
 import { PendingPrompts } from '../common/PendingPrompts';
 import { t, type StringKey } from '../i18n';
 import { useStore } from '../react-utils';
@@ -42,10 +43,15 @@ function Store({ loader }: { loader: PluginLoader }) {
   const [sources, setSources] = useState<StoreSource[]>([]);
   const [error, setError] = useState<string>();
   const installed = useStore(loader.installed);
-  const developer = useStore(loader.settings.values)['developer.enabled'];
+  const settings = useStore(loader.settings.values);
+  const developer = settings['developer.enabled'];
+  const showIncompatible = settings['remora.storeShowIncompatible'];
+  const [device, setDevice] = useState<DeviceInfo>();
 
   useEffect(() => {
-    loader.backend.call<StoreSource[]>('remora/store/sources').then(setSources, () => {});
+    loader.backend.call<StoreSource[]>('remora/store/sources').then((s) => setSources(Array.isArray(s) ? s : []), () => {});
+    // an older backend has no remora/device: the line is left out
+    loader.backend.call<DeviceInfo>('remora/device').then((d) => setDevice(d ?? undefined), () => {});
   }, []);
 
   useEffect(() => {
@@ -55,15 +61,18 @@ function Store({ loader }: { loader: PluginLoader }) {
     loader.backend.call<StoreList>('remora/store/list', by, dir).then(setList, (e) => setError(errorText(e)));
   }, [sort]);
 
-  const shown = useMemo(
-    () => (list?.plugins ?? []).filter((p) => (!source || p.source === source) && matches(p, query)),
-    [list, source, query],
-  );
+  const [shown, hiddenCount] = useMemo(() => {
+    const found = (list?.plugins ?? []).filter((p) => (!source || p.source === source) && matches(p, query));
+    if (showIncompatible) return [found, 0] as const;
+    const fits = found.filter((p) => !isBlocked(p.compat));
+    return [fits, found.length - fits.length] as const;
+  }, [list, source, query, showIncompatible]);
   const sourceName = (id: string) => sources.find((s) => s.id === id)?.name ?? id;
 
   return (
     <Focusable style={{ padding: '60px 24px 24px', height: '100%', boxSizing: 'border-box', overflowY: 'auto' }}>
-      <h2 style={{ marginTop: 0 }}>{t('store.title')}</h2>
+      <h2 style={{ marginTop: 0, marginBottom: device ? 4 : undefined }}>{t('store.title')}</h2>
+      {device && <div style={{ fontSize: 12, opacity: 0.7, marginBottom: 12 }}>{t('compat.thisDevice', { device: deviceText(device) })}</div>}
       <PendingPrompts flow={loader.installs} />
       <Focusable style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'flex-end' }} flow-children="horizontal">
         <div style={{ flex: '2 1 240px' }}>
@@ -84,6 +93,12 @@ function Store({ loader }: { loader: PluginLoader }) {
           </Field>
         </div>
       </Focusable>
+      <ToggleField
+        label={t('compat.showIncompatible')}
+        description={hiddenCount ? `${t('compat.showIncompatibleDesc')} ${t('compat.hiddenCount', { count: hiddenCount })}` : t('compat.showIncompatibleDesc')}
+        checked={showIncompatible}
+        onChange={(v) => void loader.settings.set('remora.storeShowIncompatible', v)}
+      />
       {error && <p style={{ color: '#ff6b6b' }}>{error}</p>}
       {list?.sources
         .filter((s) => !s.ok)

@@ -16,6 +16,8 @@ export interface LoaderSettings {
   'developer.enabled': boolean;
   'remora.verbose': boolean;
   'remora.storeTelemetry': boolean;
+  /** Store: list plugins the compat check rules out (unsupported, broken) too. */
+  'remora.storeShowIncompatible': boolean;
 }
 
 const DEFAULTS: LoaderSettings = {
@@ -26,6 +28,7 @@ const DEFAULTS: LoaderSettings = {
   'developer.enabled': false,
   'remora.verbose': false,
   'remora.storeTelemetry': false,
+  'remora.storeShowIncompatible': false,
 };
 
 export class Settings {

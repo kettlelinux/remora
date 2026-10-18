@@ -28,7 +28,8 @@ log = logging.getLogger("remora.utilities")
 # loader.json keys only the UI may change, through remora/settings/set: Remora's own and
 # developer.enabled (it allows installs without a hash). Every other remora.* key is refused
 # (the store's sources have remora/store/set_sources)
-UI_SETTINGS = {"remora.storeTelemetry": bool, "remora.verbose": bool, "developer.enabled": bool}
+UI_SETTINGS = {"remora.storeTelemetry": bool, "remora.verbose": bool, "developer.enabled": bool,
+               "remora.storeShowIncompatible": bool}
 
 HTTP_OPTS = {"headers", "data", "json", "params", "allow_redirects", "max_redirects", "cookies",
              "compress", "chunked", "expect100", "read_until_eof", "proxy"}
