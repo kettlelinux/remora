@@ -1,5 +1,6 @@
 #!/bin/bash
-# Build the release tarball install.sh unpacks: remora/{VERSION,remora-start,plugin_loader.service,site/}
+# Build the release tarball install.sh unpacks:
+#   remora/{VERSION,remora-start,plugin_loader.service,move-plugins.py,site/}
 # site/ is the backend and its pinned dependencies as pure-Python wheels, so one tarball serves
 # x86_64 and aarch64 and any system Python from 3.11 up (SteamOS 3.11, Bazzite 3.13+).
 # Usage: packaging/steamos/make-tarball.sh [OUT_DIR]   (default: dist/)
@@ -32,6 +33,7 @@ cp -r "$repo/backend/remora" "$root/site/"
 find "$root/site" -name __pycache__ -prune -exec rm -rf {} +
 install -m755 "$repo/packaging/remora-start" "$root/remora-start"
 install -m644 "$repo/packaging/systemd/plugin_loader.service" "$root/plugin_loader.service"
+install -m644 "$repo/packaging/steamos/move-plugins.py" "$root/move-plugins.py"
 install -m644 "$repo/LICENSE" "$root/LICENSE"
 echo "$version" >"$root/VERSION"
 
