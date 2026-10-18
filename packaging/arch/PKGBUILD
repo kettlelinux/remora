@@ -1,0 +1,58 @@
+# Remora for Arch Linux and its derivatives (SteamFork, ChimeraOS, a desktop with Steam's Game Mode).
+# Kettle Linux's own package lives in the kettlelinux repo (packages/remora): it also links the
+# image's plugins in and keeps plugins/ and loader.json in a root-owned folder.
+#
+# The backend runs on the system Python with its dependencies pinned and hash-checked
+# (packaging/requirements.txt) in a private site dir, /usr/lib/remora, so the distro's
+# python-aiohttp and friends don't matter. Only pure-Python wheels are used, which is what makes
+# the package arch=any; aiohttp, yarl and multidict fall back to their Python implementations.
+pkgname=remora
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Plugin loader for Steam Game Mode that runs Decky Loader plugins'
+arch=(any)
+url='https://github.com/kettlelinux/remora'
+# the frontend bundle includes @decky/ui, which is LGPL-2.1
+license=(MIT LGPL-2.1-only)
+depends=('python>=3.11' util-linux)  # setpriv, for remora-start
+makedepends=(git nodejs python-pip)
+provides=(decky-loader)
+conflicts=(decky-loader)
+backup=(etc/remora/remora.env)
+source=("git+https://github.com/kettlelinux/remora.git#tag=v$pkgver")
+sha256sums=('SKIP')
+
+_site=usr/lib/remora
+
+build() {
+  cd remora/frontend
+  npx --yes pnpm@10 install --frozen-lockfile --ignore-scripts
+  npx --yes pnpm@10 run build          # -> backend/remora/static
+}
+
+package() {
+  cd remora
+  local site="$pkgdir/$_site"
+  # pip evaluates markers for the Python running it, which is the one Remora will run on
+  python -m pip install --no-cache-dir --no-compile --disable-pip-version-check \
+    --require-hashes --no-deps --only-binary=:all: --implementation py \
+    --platform any --platform manylinux2014_x86_64 \
+    --target "$site" -r packaging/requirements.txt
+  rm -rf "$site/bin"
+  cp -r backend/remora "$site/"
+  find "$site" -name __pycache__ -prune -exec rm -rf {} +
+  python -m compileall -q -d "/$_site" "$site"
+
+  install -Dm755 packaging/remora-start "$site/remora-start"
+  install -Dm644 packaging/systemd/plugin_loader.service -t "$pkgdir/usr/lib/systemd/system"
+  install -Dm644 packaging/remora.env "$pkgdir/etc/remora/remora.env"
+  # `remora call` / `remora dev` for plugin developers on the device
+  install -d "$pkgdir/usr/bin"
+  printf '#!/bin/sh\nPYTHONPATH=/%s exec /usr/bin/python3 -P -m remora "$@"\n' "$_site" >"$pkgdir/usr/bin/remora"
+  chmod 755 "$pkgdir/usr/bin/remora"
+
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname"
+  if [ -f frontend/node_modules/@decky/ui/LICENSE ]; then
+    install -Dm644 frontend/node_modules/@decky/ui/LICENSE "$pkgdir/usr/share/licenses/$pkgname/decky-ui-LICENSE"
+  fi
+}

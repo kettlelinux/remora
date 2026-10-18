@@ -1,0 +1,77 @@
+#!/bin/bash
+# Start Remora (normally as root, from plugin_loader.service) for the Game Mode user.
+#  - the Game Mode user is uid 1000 unless REMORA_USER (a name or uid) or UNPRIVILEGED_USER says
+#    otherwise
+#  - ~/homebrew holds plugins/, settings/loader.json and each plugin's settings, data and logs, as
+#    with Decky on a Steam Deck. UNPRIVILEGED_PATH and PRIVILEGED_PATH move them; a distro can
+#    put plugins/ and loader.json in a root-owned PRIVILEGED_PATH so the user can't add a plugin
+#    that runs as root
+#  - folders in the user's home are made as the user (setpriv): as root, a link there could
+#    point anywhere
+#  - Steam opens its CEF devtools port (localhost:8080), which Remora injects through, only when
+#    .cef-enable-remote-debugging exists at client start
+# Settings come from /etc/remora/remora.env (KEY=value lines, read by bash; root's only), then the
+# environment systemd gives. Besides the ones above: REMORA_SITE (the folder that holds the remora
+# package and its dependencies), REMORA_PYTHON, and what Remora reads itself (SERVER_PORT,
+# LOG_LEVEL, LIVE_RELOAD, REMORA_INJECT, REMORA_CALL_TIMEOUT, REMORA_CEF_URL).
+set -eu
+
+env_file=${REMORA_ENV_FILE:-/etc/remora/remora.env}
+if [ -f "$env_file" ]; then
+  # it is sourced as root: refuse one anyone else can write
+  if [ "$(id -u)" = 0 ] && [ -n "$(find -L "$env_file" -maxdepth 0 \( ! -user 0 -o -perm /022 \) -print)" ]; then
+    echo "remora-start: $env_file must belong to root and not be writable by others" >&2
+    exit 1
+  fi
+  set -a
+  # shellcheck disable=SC1090
+  . "$env_file"
+  set +a
+fi
+
+here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+site=${REMORA_SITE:-}
+if [ -z "$site" ]; then
+  if [ -d "$here/site/remora" ]; then site=$here/site; else site=$here; fi
+fi
+py=${REMORA_PYTHON:-/usr/bin/python3}
+if ! "$py" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
+  echo "remora-start: Remora needs Python 3.11 or newer ($py is $("$py" -V 2>&1 || echo missing))" >&2
+  exit 1
+fi
+
+who=${UNPRIVILEGED_USER:-${REMORA_USER:-1000}}
+if ! IFS=: read -r user _ uid gid _ home _ < <(getent passwd "$who"); then
+  echo "remora-start: no user $who (set REMORA_USER in $env_file)" >&2
+  exit 1
+fi
+hb=${UNPRIVILEGED_PATH:-$home/homebrew}
+priv=${PRIVILEGED_PATH:-$hb}
+
+asuser() {
+  if [ "$(id -u)" = 0 ]; then
+    setpriv --reuid="$uid" --regid="$gid" --clear-groups -- "$@"
+  else
+    "$@"
+  fi
+}
+
+asuser mkdir -p "$hb"/{settings,data,logs,services} || :
+if [ "$priv" = "$hb" ]; then
+  asuser mkdir -p "$hb/plugins" || :
+else
+  install -d -m 0755 "$priv" "$priv/plugins" "$priv/settings"
+fi
+
+# Steam's two usual homes; ~/.steam/steam is normally a link to ~/.local/share/Steam
+asuser mkdir -p "$home/.local/share/Steam" || :
+asuser touch "$home/.local/share/Steam/.cef-enable-remote-debugging" || :
+if [ -d "$home/.steam/steam" ]; then
+  asuser touch "$home/.steam/steam/.cef-enable-remote-debugging" || :
+fi
+
+export UNPRIVILEGED_USER="$user" UNPRIVILEGED_PATH="$hb" PRIVILEGED_PATH="$priv"
+export PYTHONPATH="$site" PYTHONDONTWRITEBYTECODE=1
+# -P: no cwd on sys.path; / as cwd, so nothing the user can write is imported by accident
+cd /
+exec "$py" -P -m remora serve
