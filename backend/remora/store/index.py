@@ -152,7 +152,15 @@ class Fetcher:
                             f"this store requires a newer loader than {self.decky_version} (HTTP 426)")
                     if res.status != 200:
                         raise SourceError(f"HTTP {res.status} from {url}")
-                    data = await res.content.read(MAX_INDEX_BYTES + 1)
+                    # read(n) returns what has arrived so far, not the whole body
+                    chunks: list[bytes] = []
+                    size = 0
+                    async for chunk in res.content.iter_chunked(256 * 1024):
+                        chunks.append(chunk)
+                        size += len(chunk)
+                        if size > MAX_INDEX_BYTES:
+                            break
+                    data = b"".join(chunks)
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 raise SourceError(f"can't reach {url}: {e or type(e).__name__}") from None
             if len(data) > MAX_INDEX_BYTES:

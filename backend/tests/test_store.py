@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import io
@@ -123,9 +124,18 @@ class FakeStore:
                                      "created": "2026-10-01T00:00:00Z"})
         return h
 
-    async def list(self, request: web.Request) -> web.Response:
+    async def list(self, request: web.Request) -> web.StreamResponse:
         self.headers.append(request.headers.get("X-Decky-Version"))
-        return web.json_response(self.decky)
+        # in small delayed pieces, like a real network: a reader that takes the first piece
+        # for the whole body gets broken JSON
+        body = json.dumps(self.decky).encode()
+        response = web.StreamResponse(headers={"Content-Type": "application/json"})
+        await response.prepare(request)
+        for i in range(0, len(body), 64):
+            await response.write(body[i:i + 64])
+            await asyncio.sleep(0.001)
+        await response.write_eof()
+        return response
 
     async def versions(self, request: web.Request) -> web.Response:
         return web.json_response({p["name"]: [p["versions"][0]["name"], p["versions"][0]["hash"],
@@ -246,6 +256,7 @@ async def test_list_merges_sources_and_reports_426(env: Env, fake_store: FakeSto
                                     "tags": ["x"], "versions": [{"name": "2.0.0", "hash": h,
                                                                  "artifact": f"../zips/{h}.zip"}]}]
     await env.ws.routes["remora/store/set_sources"]([
+        {"id": "decky", "enabled": False},  # no real network in tests
         {"id": "local", "name": "Local", "kind": "decky", "url": fake_store.url("/plugins")},
         {"id": "idx", "name": "Idx", "kind": "index", "url": fake_store.url("/idx")},
         {"id": "old", "name": "Old", "kind": "decky", "url": fake_store.url("/old")},

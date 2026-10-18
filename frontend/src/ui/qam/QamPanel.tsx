@@ -7,7 +7,8 @@ import { hookStatuses } from '../../hooks/status';
 import { qamPlugins } from '../../runtime/ordering';
 import type { LoadedPlugin } from '../../runtime/plugin';
 import type { PluginLoader } from '../../runtime/plugin-loader';
-import { activePlugin, qamVisible } from '../../runtime/qam-state';
+import { useEffect, useRef } from 'react';
+import { activePlugin, qamVisible, reportQamDocumentVisible } from '../../runtime/qam-state';
 import { statusBadges } from '../common/badges';
 import { PendingPrompts } from '../common/PendingPrompts';
 import { TitleBar } from '../common/TitleBar';
@@ -18,11 +19,23 @@ import { QuickAccessVisibleContext } from './visibility';
 
 export function QamPanel({ loader }: { loader: PluginLoader }) {
   const visible = useStore(qamVisible);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    // the panel is rendered into the QAM window, whose document is hidden while the QAM is closed
+    const doc = ref.current?.ownerDocument;
+    if (!doc) return;
+    const update = () => reportQamDocumentVisible(doc.visibilityState === 'visible');
+    update();
+    doc.addEventListener('visibilitychange', update);
+    return () => doc.removeEventListener('visibilitychange', update);
+  }, []);
   return (
     <QuickAccessVisibleContext.Provider value={visible}>
-      <PluginBoundary>
-        <QamContent loader={loader} visible={visible} />
-      </PluginBoundary>
+      <div ref={ref} style={{ height: '100%' }}>
+        <PluginBoundary>
+          <QamContent loader={loader} visible={visible} />
+        </PluginBoundary>
+      </div>
     </QuickAccessVisibleContext.Provider>
   );
 }
@@ -65,7 +78,8 @@ function PluginList({ loader }: { loader: PluginLoader }) {
   const connected = useStore(loader.backend.connected);
   const { shown, hidden } = qamPlugins(plugins, settings);
   const disabled = installed.filter((p) => p.disabled).length;
-  const broken = hooks.some((h) => h.state === 'failed');
+  // error-reporting only keeps plugin errors out of Valve's reports; nothing visible breaks
+  const broken = hooks.some((h) => h.state === 'failed' && h.id !== 'error-reporting');
 
   return (
     <div>
