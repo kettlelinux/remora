@@ -120,31 +120,34 @@ export class Toaster {
     let group: SteamAny;
     try {
       const id = typeof store.m_nNextTestNotificationID === 'number' ? store.m_nNextTestNotificationID++ : Date.now();
-      const info = {
-        nNotificationID: id,
+      // ProcessNotification(config, notification, update): the config says how to show it (the
+      // per-type entry Steam keeps for its own notifications), the notification is what goes into
+      // the toast queue and the tray, carrying the ToastData as `data`. The ToastData itself must
+      // not be the notification: the tray is observable, and `data.data = data` recursed forever.
+      const notification = {
+        notificationID: id,
         rtCreated: Math.floor(data.timestamp.getTime() / 1000),
         eType: data.eType,
         eSource: 1,
         nToastDurationMS: data.duration,
+        bNewIndicator: data.showNewIndicator,
         data,
         decky: true,
         remora: true,
-        bCritical: data.critical,
+      };
+      const config = {
         showToast: data.showToast,
+        bCritical: data.critical,
+        bEnableInReducedUI: true,
+        toastDurationMS: data.duration,
         playSound: data.playSound,
         sound: data.sound,
-        showNewIndicator: data.showNewIndicator,
         fnTray: (toast: SteamAny, tray: SteamAny[]) => {
-          if (toast && typeof toast === 'object') {
-            toast.decky = true;
-            toast.remora = true;
-            toast.data ??= data;
-          }
           group = { eType: data.eType, notifications: [toast] };
           tray.unshift(group);
         },
       };
-      store.ProcessNotification(info, data, 0);
+      store.ProcessNotification(config, notification, 0);
     } catch (e) {
       storeHook.fail(`ProcessNotification threw: ${String(e)}`);
       return handle;
