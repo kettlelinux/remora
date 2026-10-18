@@ -87,6 +87,41 @@ class RecordingWS(WSRouter):
         return [a for e, a in self.events if e == event]
 
 
+class FakeRoot:
+    """manager.root_approved / confirm_root / confirm_mode as the root-approval spec describes
+    them, so these tests don't depend on the backend's confirmer."""
+
+    def __init__(self) -> None:
+        self.approved: set[tuple[str, str | None]] = set()
+        self.result = True
+        self.confirms: list[tuple[str, str | None, str | None, str | None]] = []
+
+    def root_approved(self, name: str, source: str | None = None) -> bool:
+        if source is None:
+            return any(n == name for n, _ in self.approved)
+        return (name, source) in self.approved
+
+    async def confirm_root(self, name: str, *, version: str | None = None, source: str | None = None,
+                           request_id: str | None = None, what: str | None = None) -> bool:
+        self.confirms.append((name, version, source, request_id))
+        if self.result:
+            self.approved.add((name, source))
+        return self.result
+
+    def confirm_mode(self) -> dict[str, str]:
+        return {"mode": "keys", "hint": "Hold Volume Up and Volume Down together for a second"}
+
+    def set_root_approved(self, name: str, approved: bool) -> None:
+        if approved:
+            self.approved.add((name, None))
+        else:
+            self.approved = {a for a in self.approved if a[0] != name}
+
+    def install(self, manager: PluginManager) -> None:
+        for attr in ("root_approved", "confirm_root", "confirm_mode", "set_root_approved"):
+            setattr(manager, attr, getattr(self, attr))
+
+
 class FakeStore:
     """One aiohttp server playing a Decky store, an index source, and a 426-ing old store."""
 
@@ -96,6 +131,11 @@ class FakeStore:
         self.index: dict[str, Any] = {"format": "decky-index/1", "source": {"id": "test"}, "plugins": []}
         self.increments: list[str] = []
         self.headers: list[str | None] = []
+        self.old_hits = 0
+        # /slow/<hash>.zip: `slow_piece` bytes every `slow_delay` seconds
+        self.slow_piece = 1024
+        self.slow_delay = 0.05
+        self.slow_started = asyncio.Event()
         app = web.Application()
         app.router.add_get("/plugins", self.list)
         app.router.add_get("/plugins/versions", self.versions)
@@ -103,6 +143,7 @@ class FakeStore:
         app.router.add_get("/zips/{file}", self.zip)
         app.router.add_get("/idx/index.json", self.get_index)
         app.router.add_get("/old/plugins", self.too_old)
+        app.router.add_get("/slow/{file}", self.slow_zip)
         self.server = TestServer(app)
 
     def url(self, path: str) -> str:
@@ -113,8 +154,10 @@ class FakeStore:
         self.zips[h] = data
         return h, self.url(f"/zips/{h}.zip")
 
-    def publish(self, name: str, version: str, data: bytes, **extra: Any) -> str:
+    def publish(self, name: str, version: str, data: bytes, slow: bool = False, **extra: Any) -> str:
         h, url = self.add_zip(data)
+        if slow:
+            url = self.url(f"/slow/{h}.zip")
         entry = next((p for p in self.decky if p["name"] == name), None)
         if entry is None:
             entry = {"id": len(self.decky) + 1, "name": name, "author": "me", "description": f"{name} desc",
@@ -155,8 +198,27 @@ class FakeStore:
     async def get_index(self, request: web.Request) -> web.Response:
         return web.json_response(self.index)
 
+    async def slow_zip(self, request: web.Request) -> web.StreamResponse:
+        data = self.zips[request.match_info["file"].removesuffix(".zip")]
+        response = web.StreamResponse(headers={"Content-Type": "application/zip",
+                                               "Content-Length": str(len(data))})
+        await response.prepare(request)
+        self.slow_started.set()
+        for i in range(0, len(data), self.slow_piece):
+            await response.write(data[i:i + self.slow_piece])
+            await asyncio.sleep(self.slow_delay)
+        await response.write_eof()
+        return response
+
     async def too_old(self, request: web.Request) -> web.Response:
+        self.old_hits += 1
         return web.Response(status=426, text="Unsupported loader version, please upgrade.")
+
+
+@pytest.fixture(autouse=True)
+def refetch_fresh_lists(monkeypatch):
+    """Tests publish and install within milliseconds; a hash miss may refetch any list."""
+    monkeypatch.setattr(store_index, "STALE_SECONDS", 0)
 
 
 @pytest.fixture
@@ -185,7 +247,12 @@ class Env:
         self.settings = Settings(self.cfg.settings_file)
         self.ws = RecordingWS()
         self.manager = PluginManager(self.cfg, self.settings, self.ws)
+        self.root = FakeRoot()
+        self.root.install(self.manager)
         self.store = StoreService(self.cfg, self.settings, self.manager, self.ws)
+        # the fake store is plain http on localhost
+        self.store.sources.allow_http = True
+        self.store.fetcher.allow_http = True
         self.ws.store = self.store
         self.store.register(self.ws)
         self.fake = fake
@@ -213,7 +280,9 @@ class Env:
         return self.ws.named("remora/install_failed")
 
     def leftovers(self) -> list[str]:
-        return [p for p in os.listdir(self.cfg.plugins_dir) if p.startswith(".")]
+        """Installer folders that should be gone (.prev-* is kept on purpose)."""
+        return [p for p in os.listdir(self.cfg.plugins_dir)
+                if p.startswith(".") and not p.startswith(".prev-")]
 
 
 @pytest.fixture
@@ -394,6 +463,11 @@ async def test_update_keeps_settings_and_skips_uninstall(env: Env, fake_store: F
     assert env.settings.get("hiddenPlugins") == ["Keeper"]
     assert env.settings.get("pluginOrder") == ["Keeper", "Other"]
     assert env.leftovers() == []
+    prev = env.cfg.plugins_dir / ".prev-my-plugin"
+    assert json.loads((prev / "package.json").read_text())["version"] == "1.0.0"
+    assert json.loads((env.cfg.plugins_dir / ".prev-my-plugin.json").read_text()) == {
+        "name": "Keeper", "version": "1.0.0", "source": "local"}
+    assert await env.ws.routes["remora/store/previous"]("Keeper") == {"version": "1.0.0", "source": "local"}
     assert "Keeper" not in await env.ws.routes["remora/store/updates"]()
 
 
@@ -428,16 +502,19 @@ async def test_root_prompt(env: Env, fake_store: FakeStore, allow: bool | None) 
     env.store.installer.root_prompt_seconds = 0.2  # None: nobody answers, it times out
     await env.install("Rooty", "1.0.0", h)
     prompts = env.ws.named("remora/root_prompt")
-    assert len(prompts) == 1 and prompts[0][1:] == ("Rooty", "1.0.0")
+    assert len(prompts) == 1 and prompts[0][1:] == ("Rooty", "1.0.0", "keys", env.root.confirm_mode()["hint"])
     if allow:
         assert env.failures() == []
-        assert env.manager.root_approved("Rooty")
+        # Allow only started the device's confirmation, which recorded the approval
+        assert env.root.confirms == [("Rooty", "1.0.0", "local", prompts[0][0])]
+        assert env.manager.root_approved("Rooty", "local")
         assert "Rooty" in env.manager.plugins
     else:
         assert "root" in env.failures()[0][1]
         assert "Rooty" not in env.manager.plugins
         assert os.listdir(env.cfg.plugins_dir) == []
         assert not env.manager.root_approved("Rooty")
+        assert env.root.confirms == []
 
 
 async def test_uninstall_runs_hook_and_keeps_homebrew_data(env: Env, fake_store: FakeStore) -> None:
@@ -547,9 +624,16 @@ async def test_signed_index(env: Env, fake_store: FakeStore) -> None:
                             {"name": "Arm", "versions": [{"name": "1.0.0", "hash": "b" * 64,
                                                           "artifact": "y.zip", "arch": ["nonexistent"]}]},
                         ]}
-    await env.ws.routes["remora/store/set_sources"]([{"id": "decky", "enabled": False},
-                                                     {"id": "idx", "kind": "index",
-                                                      "url": fake_store.url("/idx/index.json")}])
+    idx = {"id": "idx", "kind": "index", "url": fake_store.url("/idx/index.json")}
+    # keys only the index itself lists prove nothing: "self", which the UI shows as unverified
+    await env.ws.routes["remora/store/set_sources"]([{"id": "decky", "enabled": False}, idx])
+    plugins = {p["name"]: p for p in (await env.ws.routes["remora/store/list"]())["plugins"]}
+    assert plugins["Good"]["versions"][0]["signed"] == "self"
+    assert plugins["Forged"]["versions"][0]["signed"] == "invalid"
+    # pinned by the user: true
+    await env.ws.routes["remora/store/set_sources"]([
+        {"id": "decky", "enabled": False},
+        {**idx, "keys": [{"id": "k1", "alg": "ed25519", "pub": pub}]}])
     plugins = {p["name"]: p for p in (await env.ws.routes["remora/store/list"]())["plugins"]}
     assert plugins["Good"]["versions"][0]["signed"] is True
     assert plugins["Forged"]["versions"][0]["signed"] == "invalid"
@@ -576,3 +660,297 @@ def test_semver_rules() -> None:
     assert store_index.is_newer("1.2.3", "1.2.3-abc1234")
     assert not store_index.is_newer("nightly", "1.0.0")
     assert not store_index.is_newer("1.0.0", "1.0.0")
+
+
+# -- review fixes ------------------------------------------------------------------------------
+
+async def test_pinned_keys_without_cryptography_fail_closed(env: Env, fake_store: FakeStore,
+                                                            monkeypatch) -> None:
+    monkeypatch.setattr(store_index, "HAVE_CRYPTO", False)
+    sig = {"key": "k1", "alg": "ed25519", "value": "AAAA"}
+    fake_store.index = {"format": "decky-index/1",
+                        "source": {"id": "t", "keys": [{"id": "k1", "alg": "ed25519", "pub": "AAAA"}]},
+                        "plugins": [{"name": "P", "versions": [{"name": "1.0.0", "hash": "a" * 64,
+                                                                 "artifact": "p.zip", "sig": sig}]}]}
+    idx = {"id": "idx", "kind": "index", "url": fake_store.url("/idx/index.json")}
+    await env.ws.routes["remora/store/set_sources"]([{"id": "decky", "enabled": False}, idx])
+    plugins = (await env.ws.routes["remora/store/list"]())["plugins"]
+    assert plugins[0]["versions"][0]["signed"] is False  # self-listed keys: unchecked, as unsigned
+    await env.ws.routes["remora/store/set_sources"]([
+        {"id": "decky", "enabled": False}, {**idx, "keys": [{"id": "k1", "alg": "ed25519", "pub": "AAAA"}]}])
+    plugins = (await env.ws.routes["remora/store/list"]())["plugins"]
+    assert plugins[0]["versions"][0]["signed"] == "invalid"  # pinned: refused, never "unsigned"
+    assert "P" not in await env.ws.routes["remora/store/updates"]()
+
+
+async def test_plain_http_needs_pinned_keys_or_developer_mode(env: Env, fake_store: FakeStore) -> None:
+    env.store.sources.allow_http = env.store.fetcher.allow_http = False
+    set_sources = env.ws.routes["remora/store/set_sources"]
+    with pytest.raises(RouteError, match="plain http"):
+        await set_sources([{"id": "h", "kind": "decky", "url": fake_store.url("/plugins")}])
+    with pytest.raises(RouteError, match="plain http"):
+        await set_sources([{"id": "h", "kind": "index", "url": fake_store.url("/idx")}])
+    key = [{"id": "k1", "alg": "ed25519", "pub": "AAAA"}]
+    await set_sources([{"id": "decky", "enabled": False},
+                       {"id": "h", "kind": "index", "url": fake_store.url("/idx"), "keys": key}])
+    assert (await env.ws.routes["remora/store/list"]())["sources"][-1]["ok"]
+    env.settings.set("developer.enabled", True)
+    await set_sources([{"id": "decky", "enabled": False},
+                       {"id": "h", "kind": "decky", "url": fake_store.url("/plugins")}])
+    assert (await env.ws.routes["remora/store/list"]())["sources"][-1]["ok"]
+    # checked again at fetch time: turning developer mode off stops it
+    env.settings.set("developer.enabled", False)
+    env.store.fetcher.clear()
+    status = (await env.ws.routes["remora/store/list"]())["sources"][-1]
+    assert not status["ok"] and "https" in status["error"]
+
+
+async def test_file_sources_need_developer_mode_at_fetch_and_skip_fifos(env: Env, tmp_path: Path) -> None:
+    good = tmp_path / "index.json"
+    good.write_text(json.dumps({"plugins": []}))
+    fifo = tmp_path / "fifo.json"
+    os.mkfifo(fifo)
+    env.settings.set("developer.enabled", True)
+    await env.ws.routes["remora/store/set_sources"]([
+        {"id": "decky", "enabled": False},
+        {"id": "f", "kind": "index", "url": f"file://{good}"},
+        {"id": "fifo", "kind": "index", "url": f"file://{fifo}"}])
+    status = {s["id"]: s for s in (await asyncio.wait_for(env.ws.routes["remora/store/list"](), 5))["sources"]}
+    assert status["f"]["ok"]
+    assert not status["fifo"]["ok"] and "regular file" in status["fifo"]["error"]
+    env.settings.set("developer.enabled", False)
+    status = {s["id"]: s for s in (await env.ws.routes["remora/store/list"]())["sources"]}
+    assert not status["f"]["ok"] and "developer mode" in status["f"]["error"]  # even though cached
+
+
+async def test_updates_take_the_highest_version(env: Env, fake_store: FakeStore) -> None:
+    h1 = fake_store.publish("Multi", "1.0.0", make_zip(plugin_files("Multi", "1.0.0")))
+    await env.install("Multi", "1.0.0", h1)
+    versions = [{"name": n, "hash": c * 64, "artifact": f"{n}.zip", **extra} for n, c, extra in (
+        ("1.2.0", "a", {}), ("1.10.0", "b", {}), ("2.0.0", "c", {"arch": ["nonexistent"]}),
+        ("not-semver", "d", {}), ("1.9.0", "e", {}))]
+    fake_store.index = {"plugins": [{"name": "Multi", "versions": versions}]}
+    await env.ws.routes["remora/store/set_sources"]([
+        {"id": "decky", "enabled": False}, {"id": "idx", "kind": "index", "url": fake_store.url("/idx")}])
+    env.settings.set("remora.installSource", {"Multi": "idx"})
+    updates = await env.ws.routes["remora/store/updates"]()
+    assert updates["Multi"]["version"] == "1.10.0"  # not the first listed, nor the incompatible 2.0.0
+    only = {"name": "x", "compatible": True, "artifact": "a", "signed": False}
+    assert store_index.newest([only]) is only  # nothing parses: the first listed
+
+
+async def test_malformed_plugins_are_skipped_one_by_one(env: Env, fake_store: FakeStore) -> None:
+    fake_store.index = {"plugins": [
+        {"name": "Fine", "downloads": "12", "tags": "not-a-list",
+         "versions": [{"name": "1.0.0", "hash": "a" * 64, "artifact": 5, "size": "big"}]},
+        {"name": "Odd", "downloads": {"x": 1}, "tags": [1, None, "t", {"a": 1}], "author": 7,
+         "versions": "nope"},
+        {"name": 12, "versions": []},
+        "garbage",
+        {"name": "Ok", "downloads": 3, "versions": [{"name": 2, "hash": "B" * 64, "artifact": "ok.zip"},
+                                                     {"name": "x", "hash": 7}]},
+    ]}
+    fake_store.publish("DeckyOne", "1.0.0", b"zip")
+    fake_store.decky.append({"name": "Broken", "tags": 5, "versions": [{"name": "1", "hash": 3}]})
+    await env.ws.routes["remora/store/set_sources"]([
+        {"id": "decky", "enabled": False},
+        {"id": "local", "kind": "decky", "url": fake_store.url("/")},
+        {"id": "idx", "kind": "index", "url": fake_store.url("/idx")}])
+    result = await env.ws.routes["remora/store/list"]("downloads", "desc")
+    assert all(s["ok"] for s in result["sources"])
+    by_name = {p["name"]: p for p in result["plugins"]}
+    assert set(by_name) == {"Fine", "Odd", "Ok", "DeckyOne", "Broken"}
+    assert by_name["Fine"]["downloads"] == 12 and by_name["Fine"]["tags"] == []
+    assert by_name["Fine"]["versions"][0]["artifact"] is None and "size" not in by_name["Fine"]["versions"][0]
+    assert by_name["Odd"]["downloads"] == 0 and by_name["Odd"]["tags"] == ["1", "t"]
+    assert by_name["Odd"]["versions"] == [] and by_name["Odd"]["author"] == ""
+    assert [v["name"] for v in by_name["Ok"]["versions"]] == ["2"]
+    assert by_name["Ok"]["versions"][0]["hash"] == "b" * 64
+    assert by_name["Broken"]["versions"] == [] and by_name["Broken"]["tags"] == []
+    assert [p["name"] for p in result["plugins"]][0] == "Fine"
+
+
+async def test_hash_miss_refetches_once_and_failures_are_cached(env: Env, fake_store: FakeStore,
+                                                               monkeypatch) -> None:
+    monkeypatch.setattr(store_index, "STALE_SECONDS", 3600)
+    await env.ws.routes["remora/store/list"]()
+    fetched = len(fake_store.headers)
+    reqs = [{"artifact": fake_store.url(f"/zips/{c * 64}.zip"), "name": f"N{c}", "version": "1",
+             "hash": c * 64} for c in "abc"]
+    await env.ws.routes["utilities/install_plugins"](reqs)
+    assert len(fake_store.headers) == fetched  # the lists are fresh: no refetch at all
+    monkeypatch.setattr(store_index, "STALE_SECONDS", 0)
+    await env.ws.routes["utilities/install_plugins"](reqs)
+    assert len(fake_store.headers) == fetched + 1  # stale: refetched once for the whole request
+
+    await env.ws.routes["remora/store/set_sources"]([
+        {"id": "decky", "enabled": False}, {"id": "old", "kind": "decky", "url": fake_store.url("/old")}])
+    for _ in range(3):
+        status = (await env.ws.routes["remora/store/list"]())["sources"][0]
+        assert not status["ok"] and "newer loader" in status["error"]
+    assert fake_store.old_hits == 1
+
+
+def test_crash_recovery_sweep(tmp_path: Path) -> None:
+    cfg = make_cfg(tmp_path)
+    plugins = cfg.plugins_dir
+
+    def plugin(path: Path, version: str) -> None:
+        path.mkdir()
+        (path / "plugin.json").write_text(json.dumps({"name": path.name, "author": "x", "flags": []}))
+        (path / "package.json").write_text(json.dumps({"version": version}))
+
+    plugin(plugins / ".old-0123456789ab-gone", "1.0.0")  # crashed after moving it aside
+    plugin(plugins / ".old-ba9876543210-both", "1.0.0")  # crashed after the new one was in place
+    plugin(plugins / "both", "2.0.0")
+    (plugins / ".staging-abc").mkdir()
+    (plugins / ".staging-abc" / "plugin.zip").write_bytes(b"x")
+    settings = Settings(cfg.settings_file)
+    ws = RecordingWS()
+    manager = PluginManager(cfg, settings, ws)
+    StoreService(cfg, settings, manager, ws)
+    assert sorted(os.listdir(plugins)) == [".prev-both", "both", "gone"]
+    assert json.loads((plugins / "gone" / "package.json").read_text())["version"] == "1.0.0"
+    assert json.loads((plugins / "both" / "package.json").read_text())["version"] == "2.0.0"
+
+
+async def test_cancel_during_download_keeps_the_old_version(env: Env, fake_store: FakeStore) -> None:
+    h1 = fake_store.publish("Slowpoke", "1.0.0", make_zip(plugin_files("Slowpoke", "1.0.0", main=True)))
+    await env.install("Slowpoke", "1.0.0", h1)
+    big = plugin_files("Slowpoke", "2.0.0", main=True, extra={"my-plugin/blob": os.urandom(64 * 1024)})
+    h2 = fake_store.publish("Slowpoke", "2.0.0", make_zip(big), slow=True)
+    fake_store.slow_piece = 1024
+    await env.ws.routes["utilities/install_plugin"](fake_store.url(f"/slow/{h2}.zip"), "Slowpoke",
+                                                    "2.0.0", h2, 0)
+    request_id = env.ws.named("loader/add_plugin_install_prompt")[-1][2]
+    confirm = asyncio.ensure_future(env.ws.routes["utilities/confirm_plugin_install"](request_id))
+    await asyncio.wait_for(fake_store.slow_started.wait(), 5)
+    await asyncio.sleep(0.1)
+    await env.ws.routes["utilities/cancel_plugin_install"](request_id)
+    await asyncio.wait_for(confirm, 5)  # the confirm route returns normally
+    assert env.failures()[-1] == ("Slowpoke", "cancelled")
+    assert env.ws.named("loader/plugin_download_finish")[-1] == ("Slowpoke",)
+    assert env.manager.plugins["Slowpoke"].info.version == "1.0.0"
+    assert env.manager.status("Slowpoke")["state"] in ("running", "starting")
+    assert env.leftovers() == []
+    assert env.store._running == {}
+
+
+async def test_cancel_during_the_swap_finishes_it_consistently(env: Env, fake_store: FakeStore,
+                                                               monkeypatch) -> None:
+    h1 = fake_store.publish("Swappy", "1.0.0", make_zip(plugin_files("Swappy", "1.0.0", main=True)))
+    await env.install("Swappy", "1.0.0", h1)
+    h2 = fake_store.publish("Swappy", "2.0.0", make_zip(plugin_files("Swappy", "2.0.0", main=True)))
+    real = env.manager.load_dir
+    loading = asyncio.Event()
+
+    async def slow_load(path: Path):
+        loading.set()
+        await asyncio.sleep(0.2)
+        return await real(path)
+
+    monkeypatch.setattr(env.manager, "load_dir", slow_load)
+    await env.ws.routes["utilities/install_plugin"](fake_store.url(f"/zips/{h2}.zip"), "Swappy",
+                                                    "2.0.0", h2, 0)
+    request_id = env.ws.named("loader/add_plugin_install_prompt")[-1][2]
+    confirm = asyncio.ensure_future(env.ws.routes["utilities/confirm_plugin_install"](request_id))
+    await asyncio.wait_for(loading.wait(), 5)
+    await env.ws.routes["utilities/cancel_plugin_install"](request_id)
+    await asyncio.wait_for(confirm, 5)
+    # the swap was not cut in half: the new version is in and recorded, nothing is left over
+    assert env.manager.plugins["Swappy"].info.version == "2.0.0"
+    assert env.settings.get("remora.installSource")["Swappy"] == "local"
+    assert env.leftovers() == []
+
+
+async def test_stalled_download_aborts(env: Env, fake_store: FakeStore) -> None:
+    data = make_zip(plugin_files("Stall", "1.0.0", extra={"my-plugin/blob": os.urandom(32 * 1024)}))
+    h = fake_store.publish("Stall", "1.0.0", data, slow=True)
+    fake_store.slow_piece, fake_store.slow_delay = 64, 0.05  # ~1.3 KB/s
+    env.store.installer.min_rate = 10 * 1024
+    env.store.installer.rate_window = 0.3
+    await asyncio.wait_for(env.install("Stall", "1.0.0", h, artifact=fake_store.url(f"/slow/{h}.zip")), 5)
+    assert "stalled" in env.failures()[-1][1]
+    env.store.installer.min_rate = 1
+    env.store.installer.download_deadline = 0.3
+    await asyncio.wait_for(env.install("Stall", "1.0.0", h, artifact=fake_store.url(f"/slow/{h}.zip")), 5)
+    assert "took more than" in env.failures()[-1][1]
+    assert "Stall" not in env.manager.plugins and env.leftovers() == []
+    # the lock is free again: a normal install goes through
+    h2 = fake_store.publish("After", "1.0.0", make_zip(plugin_files("After", "1.0.0", folder="after")))
+    env.store.installer.download_deadline = 60
+    await env.install("After", "1.0.0", h2)
+    assert "After" in env.manager.plugins
+
+
+async def test_rollback_route(env: Env, fake_store: FakeStore) -> None:
+    rollback = env.ws.routes["remora/store/rollback"]
+    h1 = fake_store.publish("Back", "1.0.0", make_zip(plugin_files("Back", "1.0.0", main=True)))
+    await env.install("Back", "1.0.0", h1)
+    with pytest.raises(RouteError, match="no previous version"):
+        await rollback("Back")
+    h2 = fake_store.publish("Back", "2.0.0", make_zip(plugin_files("Back", "2.0.0", main=True)))
+    await env.install("Back", "2.0.0", h2)
+    assert await rollback("Back") == {"name": "Back", "version": "1.0.0"}
+    assert env.manager.plugins["Back"].info.version == "1.0.0"
+    assert env.manager.status("Back")["state"] in ("running", "starting")
+    assert not (env.cfg.homebrew / "data" / "my-plugin" / "uninstalled").exists()
+    assert await env.ws.routes["remora/store/previous"]("Back") == {"version": "2.0.0", "source": "local"}
+    assert (await rollback("Back"))["version"] == "2.0.0"  # and back again
+    assert env.leftovers() == []
+    await env.ws.routes["utilities/uninstall_plugin"]("Back")
+    assert os.listdir(env.cfg.plugins_dir) == []  # the kept version goes with it
+    with pytest.raises(RouteError):
+        await rollback("Back")
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+async def test_root_reprompt_on_source_change(env: Env, fake_store: FakeStore, confirmed: bool) -> None:
+    h1 = fake_store.publish("Rooty", "1.0.0", make_zip(plugin_files("Rooty", "1.0.0", root=True)))
+    env.ws.root_answer = True
+    await env.install("Rooty", "1.0.0", h1)
+    assert env.failures() == [] and len(env.root.confirms) == 1
+    # an update from the same source: no new prompt
+    h2 = fake_store.publish("Rooty", "1.1.0", make_zip(plugin_files("Rooty", "1.1.0", root=True)))
+    await env.install("Rooty", "1.1.0", h2)
+    assert env.failures() == [] and len(env.ws.named("remora/root_prompt")) == 1
+    # the same plugin from another source: asked again, and the device decides
+    await env.ws.routes["remora/store/set_sources"]([
+        {"id": "decky", "enabled": False},
+        {"id": "local", "kind": "decky", "url": fake_store.url("/"), "enabled": False},
+        {"id": "other", "kind": "decky", "url": fake_store.url("/plugins")}])
+    h3 = fake_store.publish("Rooty", "1.2.0", make_zip(plugin_files("Rooty", "1.2.0", root=True)))
+    env.root.result = confirmed
+    await env.install("Rooty", "1.2.0", h3)
+    assert len(env.ws.named("remora/root_prompt")) == 2
+    assert env.root.confirms[-1][:3] == ("Rooty", "1.2.0", "other")
+    if confirmed:
+        assert env.failures() == []
+        assert env.manager.plugins["Rooty"].info.version == "1.2.0"
+        assert env.settings.get("remora.installSource")["Rooty"] == "other"
+    else:
+        assert "not confirmed" in env.failures()[-1][1]
+        assert env.manager.plugins["Rooty"].info.version == "1.1.0"
+        assert env.settings.get("remora.installSource")["Rooty"] == "local"
+    # no known source (a URL no enabled store lists): asked every time
+    data = make_zip(plugin_files("Rooty", "1.3.0", root=True))
+    h4, url = fake_store.add_zip(data)
+    env.root.result = False
+    await env.install("Rooty", "1.3.0", h4, artifact=url)
+    assert len(env.ws.named("remora/root_prompt")) == 3
+    assert env.root.confirms[-1][2] is None
+
+
+async def test_answer_root_alone_never_approves(env: Env, fake_store: FakeStore) -> None:
+    h = fake_store.publish("Rooty", "1.0.0", make_zip(plugin_files("Rooty", "1.0.0", root=True)))
+    env.ws.root_answer = True
+    env.root.result = False  # the person at the device didn't hold the keys
+    await env.install("Rooty", "1.0.0", h)
+    assert "not confirmed" in env.failures()[0][1]
+    assert not env.root.approved and "Rooty" not in env.manager.plugins
+
+
+def test_ssl_context_uses_a_trust_store() -> None:
+    from remora.store.tls import ssl_context
+    ctx = ssl_context()
+    assert ctx.verify_mode.name == "CERT_REQUIRED" and ctx.check_hostname

@@ -13,11 +13,11 @@ from yarl import URL
 from ..config import Config
 from ..plugins.manager import PluginManager
 from ..settings import Settings
-from ..utilities import ssl_context
 from ..wsrouter import RouteError, WSRouter
 from .index import Fetcher, Listing, SourceError, is_newer
 from .install import INSTALL_SOURCE, InstallItem, Installer
 from .sources import Sources, StoreSource
+from .tls import ssl_context
 
 log = logging.getLogger("remora.store")
 
@@ -38,7 +38,7 @@ def _sort_key(sort_by: str) -> Any:
     if sort_by == "date":
         return lambda p: str(p.get("updated") or (p.get("versions") or [{}])[0].get("created") or "")
     if sort_by == "downloads":
-        return lambda p: int(p.get("downloads") or 0)
+        return lambda p: p.get("downloads") if isinstance(p.get("downloads"), int) else 0
     return lambda p: str(p.get("name") or "").lower()
 
 
@@ -51,10 +51,14 @@ class StoreService:
         self.sources = Sources(settings)
         self._ssl = ssl_context()
         self._http: aiohttp.ClientSession | None = None
-        self.fetcher = Fetcher(self.session, self._ssl, cfg.decky_version)
+        self.fetcher = Fetcher(self.session, self._ssl, cfg.decky_version,
+                               developer=lambda: bool(settings.get("developer.enabled")))
         self.installer = Installer(cfg, settings, manager, ws, self.session, self._ssl,
                                    after_install=self._telemetry)
+        # before the plugin manager loads anything: undo what a crash cut short
+        self.installer.recover()
         self._requests: dict[str, list[InstallItem]] = {}
+        self._running: dict[str, asyncio.Task[Any]] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
 
     def session(self) -> aiohttp.ClientSession:
@@ -74,19 +78,21 @@ class StoreService:
             "remora/store/list": self.list,
             "remora/store/updates": self.updates,
             "remora/store/answer_root": self.answer_root,
+            "remora/store/rollback": self.rollback,
+            "remora/store/previous": self.previous,
         }
         for name, fn in routes.items():
             ws.add_route(name, fn)
 
     async def close(self) -> None:
-        for task in list(self._tasks):
+        for task in list(self._tasks) + list(self._running.values()):
             task.cancel()
         if self._http is not None:
             await self._http.close()
 
     def status(self) -> dict[str, Any]:
         return {"sources": [s.to_json() for s in self.sources.all()],
-                "pendingRequests": len(self._requests)}
+                "pendingRequests": len(self._requests), "runningInstalls": len(self._running)}
 
     # -- sources -----------------------------------------------------------------------------
 
@@ -183,7 +189,8 @@ class StoreService:
 
     # -- install requests --------------------------------------------------------------------
 
-    async def _make_item(self, raw: dict[str, Any], results: Results | None) -> InstallItem:
+    async def _make_item(self, raw: dict[str, Any], results: Results | None,
+                         refetched: list[bool] | None = None) -> InstallItem:
         artifact = raw.get("artifact")
         if not isinstance(artifact, str) or not artifact:
             raise RouteError("ValueError", "install needs an artifact URL")
@@ -195,11 +202,15 @@ class StoreService:
                            version=str(raw.get("version") or "dev"), hash=str(raw.get("hash") or ""),
                            install_type=install_type)
         found = self._find_version(results, item.name, item.hash) if item.hash and results else None
-        if found is None and item.hash and results is not None:
-            # maybe published after the list was cached
-            self.fetcher.clear()
-            results[:] = await self._listings()
-            found = self._find_version(results, item.name, item.hash)
+        if found is None and item.hash and results is not None \
+                and (refetched is None or not refetched[0]):
+            # maybe published after the list was cached: once per request, and only lists that
+            # are not fresh anyway (failures stay cached for a minute)
+            if refetched is not None:
+                refetched[0] = True
+            if self.fetcher.drop_stale():
+                results[:] = await self._listings()
+                found = self._find_version(results, item.name, item.hash)
         if found is not None:
             source, plugin, version = found
             item.source = source.id
@@ -221,7 +232,7 @@ class StoreService:
                              hash: str = "", install_type: int = 0) -> None:
         results = await self._listings() if hash else None
         item = await self._make_item({"artifact": artifact, "name": name, "version": version,
-                                      "hash": hash, "install_type": install_type}, results)
+                                      "hash": hash, "install_type": install_type}, results, [False])
         request_id = secrets.token_hex(8)
         self._requests[request_id] = [item]
         await self.ws.emit("loader/add_plugin_install_prompt", item.name, item.version, request_id,
@@ -232,7 +243,9 @@ class StoreService:
         if not isinstance(requests, list) or not requests:
             raise RouteError("ValueError", "install_plugins takes a list of plugins")
         results = await self._listings()
-        items = [await self._make_item(r if isinstance(r, dict) else {}, results) for r in requests]
+        refetched = [False]
+        items = [await self._make_item(r if isinstance(r, dict) else {}, results, refetched)
+                 for r in requests]
         request_id = secrets.token_hex(8)
         self._requests[request_id] = items
         await self.ws.emit("loader/add_multiple_plugins_install_prompt", request_id,
@@ -240,20 +253,51 @@ class StoreService:
         await self._emit_details(request_id, items)
 
     async def confirm_plugin_install(self, request_id: str) -> None:
-        items = self._requests.pop(str(request_id), None)
+        request_id = str(request_id)
+        items = self._requests.pop(request_id, None)
         if items is None:
             raise RouteError("KeyError", f"no install request {request_id!r}")
-        for item in items:
-            await self.installer.install(item)
+
+        async def run() -> None:
+            for item in items:
+                await self.installer.install(item)
+
+        task = asyncio.ensure_future(run())
+        self._running[request_id] = task
+        try:
+            # shielded: a dropped WebSocket doesn't cut an install short, only cancel does
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled():
+                return  # cancel_plugin_install; the installer rolled back and reported it
+            raise
+        finally:
+            if task.done():
+                self._running.pop(request_id, None)
+            else:
+                task.add_done_callback(lambda _: self._running.pop(request_id, None))
 
     async def cancel_plugin_install(self, request_id: str) -> None:
-        self._requests.pop(str(request_id), None)
+        """Drops a pending request, or stops a confirmed one that is still running (the old
+        version stays, or comes back)."""
+        request_id = str(request_id)
+        self._requests.pop(request_id, None)
+        task = self._running.get(request_id)
+        if task is not None and not task.done():
+            log.info("cancelling install request %s", request_id)
+            task.cancel()
 
     async def uninstall_plugin(self, name: str) -> None:
         await self.installer.uninstall(name)
 
+    async def rollback(self, name: str) -> dict[str, Any]:
+        return await self.installer.rollback(str(name))
+
+    async def previous(self, name: str) -> dict[str, Any] | None:
+        return self.installer.previous(str(name))
+
     async def answer_root(self, request_id: str, allow: bool) -> None:
-        self.installer.answer_root(str(request_id), bool(allow))
+        self.installer.answer_root(str(request_id), allow is True)
 
     # -- telemetry ---------------------------------------------------------------------------
 

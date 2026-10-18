@@ -34,7 +34,8 @@ class StoreSource:
     url: str
     enabled: bool = True
     builtin: bool = False
-    # pinned ed25519 keys for an index source ({id, alg, pub}); empty = trust the index's own
+    # ed25519 keys the user pinned for an index source ({id, alg, pub}). Empty: the index's own
+    # keys are checked, but only earn signed: "self" (unverified)
     keys: list[dict[str, Any]] = field(default_factory=list)
 
     def to_json(self) -> dict[str, Any]:
@@ -66,30 +67,38 @@ def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "source"
 
 
-def _check_url(url: Any, kind: str, developer: bool) -> str:
+def _check_url(url: Any, kind: str, developer: bool, pinned: bool, allow_http: bool = False) -> str:
+    """https always; plain http only for an index with pinned keys (the signatures, not the
+    transport, vouch for it) or in developer mode; file:// only for an index in developer mode.
+    The fetcher checks again at every fetch (index.source_problem)."""
     if not isinstance(url, str) or not url.strip():
         raise RouteError("ValueError", "a store source needs a URL")
     url = url.strip()
     scheme = urlparse(url).scheme
-    if scheme in ("http", "https"):
+    if scheme == "https":
+        return url
+    if scheme == "http" and (developer or allow_http or (kind == "index" and pinned)):
         return url
     if scheme == "file" and kind == "index" and developer:
         return url
-    raise RouteError("ValueError", f"unsupported store URL {url!r}: use http(s)"
+    if scheme == "http":
+        raise RouteError("ValueError", f"store URL {url!r} is plain http: use https (http needs "
+                         "pinned keys on an index source, or developer mode)")
+    raise RouteError("ValueError", f"unsupported store URL {url!r}: use https"
                      + (" (file:// needs developer mode)" if scheme == "file" else ""))
 
 
-def _parse(raw: Any, developer: bool) -> StoreSource:
+def _parse(raw: Any, developer: bool, allow_http: bool = False) -> StoreSource:
     if not isinstance(raw, dict):
         raise RouteError("ValueError", "a store source must be an object")
     kind = raw.get("kind", "decky")
     if kind not in KINDS:
         raise RouteError("ValueError", f"unknown store source kind {kind!r}")
-    url = _check_url(raw.get("url"), kind, developer)
-    name = str(raw.get("name") or urlparse(url).netloc or url)
     keys = raw.get("keys") or []
     if not isinstance(keys, list) or not all(isinstance(k, dict) for k in keys):
         raise RouteError("ValueError", "keys must be a list of {id, alg, pub}")
+    url = _check_url(raw.get("url"), kind, developer, bool(keys), allow_http)
+    name = str(raw.get("name") or urlparse(url).netloc or url)
     return StoreSource(id=str(raw.get("id") or ""), name=name, kind=kind, url=url,
                        enabled=bool(raw.get("enabled", True)), builtin=False, keys=keys)
 
@@ -110,6 +119,7 @@ def _migrate(settings: Settings) -> list[StoreSource]:
 class Sources:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
+        self.allow_http = False  # tests only: plain http to a local fake store
 
     def _developer(self) -> bool:
         return bool(self.settings.get("developer.enabled"))
@@ -132,7 +142,7 @@ class Sources:
             if not isinstance(r, dict) or r.get("id") in builtin_ids:
                 continue
             try:
-                sources.append(_parse(r, developer=True))
+                sources.append(_parse(r, developer=True))  # the fetcher re-checks
             except RouteError as e:
                 log.warning("ignoring store source %r: %s", r.get("id"), e.message)
         # keep the user's order for the custom ones, the built-ins first
@@ -156,7 +166,7 @@ class Sources:
             if isinstance(item, dict) and item.get("id") in by_id:
                 by_id[item["id"]].enabled = bool(item.get("enabled", True))
                 continue
-            source = _parse(item, developer)
+            source = _parse(item, developer, self.allow_http)
             base = source.id = _slug(source.id or source.name)
             n = 2
             while source.id in taken:
