@@ -19,7 +19,7 @@ from typing import Any, Iterable
 
 from ..device import PYTHON_PREFIX, Device
 from . import elf
-from .index import is_newer, newest
+from .index import is_newer
 
 log = logging.getLogger("remora.store")
 
@@ -239,7 +239,9 @@ class Compat:
             versions = plugin.get("versions") or []
             for v in versions:
                 v["compat"] = self.check(name, v.get("name"), v.get("arch"))
-            best = newest(versions) or (versions[0] if versions else None)
+            # the version the store card offers: the first listed (Decky lists in release order,
+            # and authors' "1.0.0-1" is a later release than "1.0.0", not a prerelease)
+            best = versions[0] if versions else None
             plugin["compat"] = best["compat"] if best else self.check(name, None)
 
     def folder(self, path: Path) -> elf.Report:

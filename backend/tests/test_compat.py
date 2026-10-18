@@ -281,6 +281,7 @@ async def portal(tmp_path: Path, fake_store: FakeStore):  # noqa: F811
         "PowerTools": {"requires": ["x86_64", "amd-cpu"], "upto": "2.0.3", "note": "AMD only."},
         "Broken Thing": {"status": "broken", "note": "Needs the Deck's EC."},
         "CSS Loader": {"status": "works", "tested": ["ayn,odin2portal"]},
+        "KDE Connect": {"requires": ["deck-user"], "upto": "0.1.0-1"},
     })
     yield e
     await e.stop()
@@ -311,6 +312,20 @@ async def test_listing_carries_compat(portal: Env, fake_store: FakeStore) -> Non
     device = await portal.ws.routes["remora/device"]()
     assert device["model"] == "AYN Odin 2 Portal" and device["facts"]["adreno-gpu"]
     assert "compat_lists" in device
+
+
+async def test_listing_follows_release_order(portal: Env, fake_store: FakeStore) -> None:
+    # authors' "-1" is a later release, though semver ranks it below 0.1.0; the card offers
+    # the first listed, and the plugin's answer (what hides it) is that version's
+    fake_store.publish("KDE Connect", "0.1.0", make_zip(plugin_files("KDE Connect", "0.1.0")))
+    fake_store.publish("KDE Connect", "0.1.0-1", make_zip(plugin_files("KDE Connect", "0.1.0-1")))
+    await portal.ws.routes["remora/store/set_sources"]([
+        {"id": "decky", "enabled": False},
+        {"id": "local", "name": "Local", "kind": "decky", "url": fake_store.url("/")}])
+    kde = next(p for p in (await portal.ws.routes["remora/store/list"]())["plugins"]
+               if p["name"] == "KDE Connect")
+    assert [v["name"] for v in kde["versions"]] == ["0.1.0-1", "0.1.0"]
+    assert kde["compat"]["state"] == "unsupported" and kde["compat"]["reasons"] == ["deck-user"]
 
 
 async def test_install_refused_unless_developer(portal: Env, fake_store: FakeStore) -> None:
