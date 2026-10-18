@@ -93,3 +93,32 @@ Remora events:
 | `remora/plugin_status` | `PluginStatus` (whenever it changes) |
 | `remora/root_prompt` | `request_id, name, version`: a plugin being installed asks for root. Answer with `remora/store/answer_root`. With no answer in 5 minutes, the install is cancelled. |
 | `remora/install_failed` | `name, message` |
+| `remora/install_request` | `request_id, [{name, version, hash, install_type, source, signed, compatible, root}]`: sent right after `loader/add_plugin_install_prompt` / `loader/add_multiple_plugins_install_prompt`, with what the store knows about each zip (matched by name + hash; `source: null` when no enabled source lists it, `root: null` when unknown). |
+
+## Store details
+
+- `StoreSource` may carry `keys: [{id, alg: "ed25519", pub}]` (base64 raw public keys) for an
+  `index` source. Pinned keys replace the ones the index lists in `source.keys`. Built-ins
+  (`decky`, `decky-testing`) always stay in the list; `set_sources` only switches them on or off.
+  Custom sources without an `id` get one from their name.
+- URLs: a `decky` source's API base is `url` if its path ends in `/plugins`, else `url + "/plugins"`.
+  An `index` source fetches `url` if its path ends in `.json`, else `url + "/index.json"`; relative
+  `artifact` URLs resolve against it, and `file://` is accepted only in developer mode.
+- `StorePlugin.versions[]` gain `signed: true | false | "invalid"` and `compatible: bool` (plus
+  `incompatible_reason` when false); index extension fields (`size`, `arch`, `min_loader`,
+  `flags`, ...) pass through. `decky` sources fill a missing `artifact` with Decky's CDN URL;
+  `index` versions without `artifact` have `artifact: null` and can't be installed.
+- Signatures: `sig.value` is an ed25519 signature over the UTF-8 bytes
+  `"decky-index/1\n" + name + "\n" + version + "\n" + lowercase sha256`. With keys present, a version
+  with no signature, an unknown key or a bad signature is `"invalid"` and refused at install.
+  `false` means unsigned, or signed but the `cryptography` module is missing.
+- Installs need a hash; only developer mode (`developer.enabled`) installs without one (and then the
+  plugin name comes from the zip). Incompatible versions (`arch`, `min_loader`) are refused unless
+  developer mode is on.
+- `loader/plugin_download_info` message keys: `Remora.install.downloading`, `.verifying`,
+  `.unpacking`, `.binaries`, `.installing`. `loader/plugin_download_finish` is sent after failures
+  too, following `remora/install_failed`.
+- `remora/root_prompt` uses its own `request_id`, not the install request's.
+- Settings keys: `remora.storeSources` (`[StoreSource]`), `remora.installSource` (`{name: source id}`),
+  `remora.storeTelemetry` (bool, default false: Decky's install counter POST, to `decky` sources
+  only). Uninstall also drops the plugin from `remora.rootApproved`.
