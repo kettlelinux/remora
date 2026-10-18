@@ -6,3 +6,4 @@ __pycache__/
 decky-ref/
 .scratch/
 *.egg-info/
+backend/remora/static/
