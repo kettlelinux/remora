@@ -7,9 +7,13 @@ put there can't point root at /etc (compat/backend.md W3, W9).
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import stat
+import sys
 from pathlib import Path
+from typing import Any
 
 _DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
@@ -98,3 +102,68 @@ def open_user_file_beneath(base: Path, rel_parts: list[str], user_home: Path) ->
     """open_beneath for a base inside the user's home, where the base itself could be a link."""
     trusted, parts = _trusted_base_and_rest(base, user_home)
     return open_beneath(trusted, parts + rel_parts)
+
+
+def list_dir(path: str, include_files: bool = True, include_folders: bool = True,
+             include_ext: list[str] | None = None, include_hidden: bool = False,
+             order_by: str = "name_asc", filter_for: str | None = None, page: int = 1,
+             max_items: int = 1000) -> dict[str, Any]:
+    """utilities/filepicker_ls. As root the loader runs this as the Game Mode user, in
+    `python -m remora.fsutil` (below), so it lists only what that user may list."""
+    real = os.path.realpath(path)
+    exts = [str(e).lower().lstrip(".") for e in (include_ext or ["all_files"])]
+    all_files = "all_files" in exts
+    matcher = None
+    if filter_for:
+        try:
+            rx = re.compile(filter_for)
+            matcher = lambda n: rx.search(n) is not None  # noqa: E731
+        except re.error:
+            matcher = lambda n: filter_for in n  # noqa: E731
+    files: list[dict[str, Any]] = []
+    with os.scandir(real) as it:
+        for entry in it:
+            if not include_hidden and entry.name.startswith("."):
+                continue
+            try:
+                st = entry.stat()
+            except OSError:
+                continue
+            is_dir = stat.S_ISDIR(st.st_mode)
+            if is_dir and not include_folders:
+                continue
+            if not is_dir:
+                if not include_files:
+                    continue
+                if not all_files and entry.name.rsplit(".", 1)[-1].lower() not in exts:
+                    continue
+            if matcher is not None and not matcher(entry.name):
+                continue
+            files.append({"isdir": is_dir, "name": entry.name,
+                          "realpath": os.path.realpath(entry.path), "size": st.st_size,
+                          "modified": st.st_mtime, "created": getattr(st, "st_birthtime", st.st_ctime)})
+    field, _, direction = (order_by or "name_asc").partition("_")
+    key = {"name": lambda f: f["name"].lower(), "modified": lambda f: f["modified"],
+           "created": lambda f: f["created"], "size": lambda f: f["size"]}.get(field,
+                                                                               lambda f: f["name"].lower())
+    files.sort(key=key, reverse=direction == "desc")
+    files.sort(key=lambda f: not f["isdir"])  # folders first, stable
+    page = max(1, int(page or 1))
+    max_items = max(1, int(max_items or 1000))
+    start = (page - 1) * max_items
+    return {"realpath": real, "files": files[start:start + max_items], "total": len(files)}
+
+
+def _main() -> None:
+    """The file picker's worker: JSON arguments of list_dir on stdin, the answer on stdout."""
+    try:
+        args = json.loads(sys.stdin.read())
+        value = list_dir(**args)
+        answer: dict[str, Any] = {"ok": True, "value": value}
+    except Exception as e:
+        answer = {"ok": False, "name": type(e).__name__, "message": str(e)}
+    sys.stdout.write(json.dumps(answer, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    _main()

@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from ..config import Config
-from ..ipc import Channel
+from ..ipc import Channel, encode
 from .manifest import PluginInfo
 
 log = logging.getLogger("remora.plugins")
@@ -50,7 +50,13 @@ class PluginCallError(Exception):
 
 
 class PluginStopped(Exception):
-    pass
+    """The call can't complete because the host isn't there. `deliberate`: it was stopped on
+    purpose (disable, reload, uninstall), so the frontend gets DISCARD; otherwise it crashed or
+    failed to start, and the caller gets an error with the plugin's error text."""
+
+    def __init__(self, message: str, deliberate: bool = False) -> None:
+        super().__init__(message)
+        self.deliberate = deliberate
 
 
 EventHandler = Callable[[str, list[Any]], Awaitable[None]]
@@ -92,6 +98,10 @@ def plugin_env(cfg: Config, info: PluginInfo) -> dict[str, str]:
     return env
 
 
+SEND_TIMEOUT = 2.0  # a host whose loop is blocked stops reading; don't wait on it forever
+LOG_LINE_LIMIT = 8192  # longer plugin output lines are cut in the log
+
+
 class PluginProcess:
     def __init__(self, cfg: Config, info: PluginInfo, on_event: EventHandler,
                  on_state: StateHandler) -> None:
@@ -112,6 +122,11 @@ class PluginProcess:
         self._crash_times: list[float] = []
         self._tasks: set[asyncio.Task[Any]] = set()
         self._restart_task: asyncio.Task[None] | None = None
+        self._restart_sleeping = False
+        self._restart_delay = 0.0
+        self._supervisor: asyncio.Task[None] | None = None
+        self._fatal: str | None = None
+        self._lock = asyncio.Lock()  # start and stop, one at a time
 
     @property
     def name(self) -> str:
@@ -134,9 +149,14 @@ class PluginProcess:
     # -- start -------------------------------------------------------------------------------
 
     async def start(self) -> None:
+        async with self._lock:
+            await self._start()
+
+    async def _start(self) -> None:
         if self.state in (State.STARTING, State.RUNNING):
             return
         self._stopping = False
+        self._fatal = None
         self._stopped_msg = asyncio.Event()
         # before the first await: a call that comes in while the host starts waits for it
         self._ready = asyncio.get_running_loop().create_future()
@@ -180,67 +200,179 @@ class PluginProcess:
             return
         finally:
             child_sock.close()  # the host has its own copy
-        self.channel = await Channel.from_socket(parent_sock)
-        self._spawn(self._relay_output(self.proc))
-        self._spawn(self._read(self.channel, self.proc))
-        log.info("started %s (pid %d%s)", self.name, self.proc.pid, ", root" if self.info.root else "")
+        proc = self.proc
+        self.channel = channel = await Channel.from_socket(parent_sock)
+        relay = self._spawn(self._relay_output(proc))
+        self._supervisor = self._spawn(self._supervise(proc, channel, relay))
+        log.info("started %s (pid %d%s)", self.name, proc.pid, ", root" if self.info.root else "")
 
     async def _relay_output(self, proc: asyncio.subprocess.Process) -> None:
-        assert proc.stdout is not None
+        """The host's stdout and stderr into the loader's log. Reads in chunks and splits lines
+        itself: a huge line is cut, never fatal (a dead relay would fill the pipe and block the
+        plugin on its next print)."""
+        stream = proc.stdout
+        assert stream is not None
         plog = logging.getLogger(f"plugin.{self.info.dir_name}")
+        buf = bytearray()
+        dropped = 0  # bytes of the current line beyond the limit
+
+        def emit(line: bytes, extra: int) -> None:  # noqa: E306
+            text = line.decode(errors="replace").rstrip()
+            if extra:
+                text += f" [... {extra} more bytes]"
+            plog.info("%s", text)
+
         while True:
-            line = await proc.stdout.readline()
-            if not line:
+            try:
+                chunk = await stream.read(65536)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # never die: keep the pipe drained
+                log.debug("%s: output relay: %s", self.name, e)
+                await asyncio.sleep(0.1)
+                continue
+            if not chunk:
+                if buf:
+                    emit(bytes(buf), dropped)
                 return
-            plog.info("%s", line.decode(errors="replace").rstrip())
+            buf += chunk
+            while True:
+                nl = buf.find(b"\n")
+                if nl < 0:
+                    break
+                line = bytes(buf[:nl])
+                del buf[:nl + 1]
+                if dropped:  # the end of a line already cut
+                    plog.info("[... %d more bytes]", dropped + len(line))
+                    dropped = 0
+                else:
+                    emit(line[:LOG_LINE_LIMIT], max(0, len(line) - LOG_LINE_LIMIT))
+            if dropped:
+                dropped += len(buf)
+                buf.clear()
+            elif len(buf) > LOG_LINE_LIMIT:
+                emit(bytes(buf[:LOG_LINE_LIMIT]), 0)
+                dropped = len(buf) - LOG_LINE_LIMIT
+                buf.clear()
 
     # -- messages ----------------------------------------------------------------------------
 
-    async def _read(self, channel: Channel, proc: asyncio.subprocess.Process) -> None:
-        fatal: str | None = None
+    async def _handle(self, message: dict[str, Any]) -> None:
+        kind = message.get("t")
+        if kind == "result":
+            call_id = message.get("id")
+            if not isinstance(call_id, int) or isinstance(call_id, bool):
+                raise ValueError(f"result with a bad id {call_id!r}")
+            fut = self._pending.pop(call_id, None)
+            if fut is not None and not fut.done():
+                if message.get("ok"):
+                    fut.set_result(message.get("value"))
+                else:
+                    error = message.get("error")
+                    fut.set_exception(PluginCallError(error if isinstance(error, dict) else {}))
+        elif kind == "event":
+            args = message.get("args")
+            if args is None:
+                args = []
+            if not isinstance(args, list):
+                raise ValueError("event args is not a list")
+            self._spawn(self.on_event(str(message.get("event")), args))
+        elif kind == "ready":
+            if self._ready is not None and not self._ready.done():
+                self._ready.set_result(None)
+            await self._set_state(State.RUNNING)
+        elif kind == "fatal":
+            err = message.get("error")
+            err = err if isinstance(err, dict) else {}
+            self._fatal = f"{err.get('name')}: {err.get('message')}"
+        elif kind == "stopped":
+            self._stopped_msg.set()
+
+    async def _read(self, channel: Channel) -> None:
         while True:
             message = await channel.receive()
             if message is None:
-                break
-            kind = message.get("t")
-            if kind == "result":
-                fut = self._pending.pop(message.get("id"), None)  # type: ignore[arg-type]
-                if fut is not None and not fut.done():
-                    if message.get("ok"):
-                        fut.set_result(message.get("value"))
-                    else:
-                        fut.set_exception(PluginCallError(message.get("error") or {}))
-            elif kind == "event":
-                self._spawn(self.on_event(str(message.get("event")), list(message.get("args") or [])))
-            elif kind == "ready":
-                if self._ready is not None and not self._ready.done():
-                    self._ready.set_result(None)
-                await self._set_state(State.RUNNING)
-            elif kind == "fatal":
-                err = message.get("error") or {}
-                fatal = f"{err.get('name')}: {err.get('message')}"
-            elif kind == "stopped":
-                self._stopped_msg.set()
-        await self._on_exit(channel, proc, fatal)
+                return
+            try:
+                await self._handle(message)
+            except Exception as e:  # a malformed message must not end exit handling
+                log.warning("%s sent a bad message: %s", self.name, e)
 
-    async def _on_exit(self, channel: Channel, proc: asyncio.subprocess.Process,
-                       fatal: str | None) -> None:
-        channel.close()
+    async def _wait_exit(self, proc: asyncio.subprocess.Process) -> None:
+        """Until the host process itself exits. Not proc.wait(): on Python 3.11 that also waits
+        for stdout to close, which a child the plugin started can keep open for ever."""
+        if proc.returncode is not None:
+            return
+        loop = asyncio.get_running_loop()
+        pidfd: int | None = None
         try:
-            code = await asyncio.wait_for(proc.wait(), 5)
-        except asyncio.TimeoutError:
-            self._kill_group(proc)
-            code = await proc.wait()
+            pidfd = os.pidfd_open(proc.pid)
+        except (AttributeError, OSError):
+            pass
+        if pidfd is not None:
+            exited: asyncio.Future[None] = loop.create_future()
+            loop.add_reader(pidfd, lambda: exited.done() or exited.set_result(None))
+            try:
+                while proc.returncode is None and not exited.done():
+                    try:
+                        await asyncio.wait_for(asyncio.shield(exited), 1.0)
+                    except asyncio.TimeoutError:
+                        pass
+            finally:
+                loop.remove_reader(pidfd)
+                os.close(pidfd)
+        # the child watcher reaps it and sets returncode right after
+        while proc.returncode is None:
+            await asyncio.sleep(0.01 if pidfd is not None else 0.05)
+
+    async def _supervise(self, proc: asyncio.subprocess.Process, channel: Channel,
+                         relay: asyncio.Task[None]) -> None:
+        reader = self._spawn(self._read(channel))
+        exited = self._spawn(self._wait_exit(proc))
+        await asyncio.wait({reader, exited}, return_when=asyncio.FIRST_COMPLETED)
+        if not exited.done():
+            # the channel closed but the host lives on: give it a moment, then kill it
+            try:
+                await asyncio.wait_for(asyncio.shield(exited), 5)
+            except asyncio.TimeoutError:
+                self._kill_group(proc)
+                await exited
+        else:
+            # the host is gone: take what it sent before exiting (a "fatal"), but don't wait on
+            # a socket a forked child still holds
+            try:
+                await asyncio.wait_for(asyncio.shield(reader), 1)
+            except asyncio.TimeoutError:
+                reader.cancel()
+        await self._on_exit(proc, channel, relay)
+
+    async def _on_exit(self, proc: asyncio.subprocess.Process, channel: Channel,
+                       relay: asyncio.Task[None]) -> None:
+        channel.close()
         self._kill_group(proc)  # leftovers the plugin started
+        code = proc.returncode
+        # the relay drains what is left, unless a child that escaped the group holds the pipe
+        try:
+            await asyncio.wait_for(asyncio.shield(relay), 0.5)
+        except asyncio.TimeoutError:
+            relay.cancel()
+        transport = getattr(proc, "_transport", None)
+        if transport is not None:
+            transport.close()
         if self.channel is channel:
             self.channel = None
-        failure: Exception = PluginStopped(f"{self.name} stopped")
+        fatal = self._fatal
+        deliberate = self._stopping
+        failure = PluginStopped(f"{self.name} stopped" if deliberate
+                                else f"{self.name} {fatal or f'exited with code {code}'}",
+                                deliberate)
         for fut in self._pending.values():
             if not fut.done():
                 fut.set_exception(failure)
         self._pending.clear()
         if self._ready is not None and not self._ready.done():
-            self._ready.set_exception(PluginStopped(fatal or f"{self.name} exited ({code})"))
+            self._ready.set_exception(PluginStopped(fatal or f"{self.name} exited ({code})",
+                                                    deliberate))
             self._ready.exception()  # mark retrieved
         if self._stopping:
             await self._set_state(State.STOPPED)
@@ -254,15 +386,23 @@ class PluginProcess:
                                                  "not restarting until it's reloaded")
             return
         delay = RESTART_DELAYS[len(self._crash_times) - 1]
-        await self._set_state(State.CRASHED, f"{error}; restarting in {delay} s")
+        await self._set_state(State.CRASHED, f"{error}; restarting in {delay:g} s")
+        self._restart_delay = delay
+        self._restart_sleeping = True
         self._restart_task = self._spawn(self._restart_later(delay))
 
     async def _restart_later(self, delay: float) -> None:
-        await asyncio.sleep(delay)
-        if self._stopping or self.state != State.CRASHED:
-            return
-        self.restarts += 1
-        await self.start()
+        try:
+            await asyncio.sleep(delay)
+        finally:
+            self._restart_sleeping = False
+        # from here on stop() doesn't cancel this task (that could orphan a host being spawned);
+        # it waits for the lock and stops what was started
+        async with self._lock:
+            if self._stopping or self.state != State.CRASHED:
+                return
+            self.restarts += 1
+            await self._start()
 
     def _kill_group(self, proc: asyncio.subprocess.Process) -> None:
         try:
@@ -270,8 +410,27 @@ class PluginProcess:
         except (ProcessLookupError, PermissionError):
             pass
 
+    def _not_running(self) -> PluginStopped:
+        deliberate = self._stopping or self.state == State.STOPPED
+        detail = f": {self.error}" if self.error and not deliberate else ""
+        return PluginStopped(f"{self.name} is not running ({self.state.value}){detail}", deliberate)
+
+    async def _await_restart(self) -> None:
+        """A call to a crashed plugin that is about to restart waits for it, once."""
+        task = self._restart_task
+        if self.state != State.CRASHED or task is None or task.done():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), self._restart_delay + 1)
+        except asyncio.TimeoutError:
+            pass
+        except asyncio.CancelledError:
+            if not task.cancelled():
+                raise
+
     async def call(self, method: str, args: list[Any] | None = None,
                    kwargs: dict[str, Any] | None = None, legacy: bool = False) -> Any:
+        await self._await_restart()
         if self.state == State.STARTING and self._ready is not None:
             try:
                 await asyncio.shield(self._ready)
@@ -279,14 +438,23 @@ class PluginProcess:
                 pass
         channel = self.channel
         if channel is None or self.state != State.RUNNING:
-            raise PluginStopped(f"{self.name} is not running ({self.state.value})")
+            raise self._not_running()
         self._next_id += 1
         call_id = self._next_id
         fut: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         self._pending[call_id] = fut
-        await channel.send({"t": "call", "id": call_id, "method": method, "args": args or [],
-                            "kwargs": kwargs or {}, "legacy": legacy})
         try:
+            data = encode({"t": "call", "id": call_id, "method": method, "args": args or [],
+                           "kwargs": kwargs or {}, "legacy": legacy})
+            try:
+                await asyncio.wait_for(channel.send_encoded(data), SEND_TIMEOUT)
+            except asyncio.TimeoutError:
+                raise PluginCallError({"name": "TimeoutError",
+                                       "message": f"{self.name} isn't reading its calls (busy?)",
+                                       "traceback": None}) from None
+            except (ConnectionError, RuntimeError):
+                if not fut.done():
+                    raise self._not_running() from None
             if self.cfg.call_timeout > 0:
                 return await asyncio.wait_for(fut, self.cfg.call_timeout)
             return await fut
@@ -301,29 +469,43 @@ class PluginProcess:
 
     async def stop(self, uninstall: bool = False) -> None:
         self._stopping = True
-        if self._restart_task is not None:
+        if self._restart_task is not None and self._restart_sleeping:
             self._restart_task.cancel()
-        proc, channel = self.proc, self.channel
-        if proc is None or proc.returncode is not None:
-            await self._set_state(State.STOPPED)
+        async with self._lock:  # a start in flight finishes first, then is stopped here
+            self._stopping = True
+            await self._stop(uninstall)
+        self._crash_times.clear()
+
+    async def _stop(self, uninstall: bool) -> None:
+        proc, channel, supervisor = self.proc, self.channel, self._supervisor
+        if proc is None or supervisor is None or supervisor.done():
+            if self.state != State.STOPPED:
+                await self._set_state(State.STOPPED)
             return
-        if channel is not None:
+        sent = False
+        if channel is not None and proc.returncode is None:
             try:
-                await channel.send({"t": "stop", "uninstall": uninstall})
-            except (ConnectionError, RuntimeError):
+                await asyncio.wait_for(channel.send({"t": "stop", "uninstall": uninstall}),
+                                       SEND_TIMEOUT)
+                sent = True
+            except (asyncio.TimeoutError, ConnectionError, RuntimeError):
+                pass
+        if not sent and proc.returncode is None:
+            try:  # its loop doesn't read: the host's SIGTERM handler still runs _unload
+                os.kill(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
                 pass
         try:
-            await asyncio.wait_for(proc.wait(), self.cfg.stop_timeout)
+            await asyncio.wait_for(asyncio.shield(supervisor), self.cfg.stop_timeout)
         except asyncio.TimeoutError:
             log.warning("%s did not stop within %g s, killing it", self.name, self.cfg.stop_timeout)
             self._kill_group(proc)
-            await proc.wait()
-        # let _read finish its exit handling
-        for _ in range(50):
-            if self.state == State.STOPPED:
-                break
-            await asyncio.sleep(0.02)
-        self._crash_times.clear()
+            try:
+                await asyncio.wait_for(asyncio.shield(supervisor), 10)
+            except asyncio.TimeoutError:
+                log.error("%s: exit handling is stuck", self.name)
+        if self.state != State.STOPPED:
+            await self._set_state(State.STOPPED)
 
     def status(self) -> dict[str, Any]:
         return {"state": self.state.value, "restarts": self.restarts, "error": self.error,

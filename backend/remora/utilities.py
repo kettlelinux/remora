@@ -3,32 +3,37 @@
 from __future__ import annotations
 
 import asyncio
+import collections
+import json
 import logging
 import os
-import re
-import ssl
-import stat
-from pathlib import Path
+import signal
+import sys
 from typing import Any
 
 import aiohttp
-import certifi
 
 from .cdp import CDP
 from .config import Config
+from .fsutil import list_dir, open_user_file_beneath
 from .plugins.manager import PluginManager
+from .plugins.process import PACKAGE_PARENT
 from .settings import Settings
+from .store.tls import ssl_context  # noqa: F401  (server.py imports it from here)
 from .wsrouter import RouteError, WSRouter
 
 log = logging.getLogger("remora.utilities")
 
 # extra_opts keys of utilities/http_request passed on to aiohttp; Decky passes all of them
+# loader.json keys only the UI may change, through remora/settings/set: Remora's own and
+# developer.enabled (it allows installs without a hash). Every other remora.* key is refused
+# (the store's sources have remora/store/set_sources)
+UI_SETTINGS = {"remora.storeTelemetry": bool, "remora.verbose": bool, "developer.enabled": bool}
+
 HTTP_OPTS = {"headers", "data", "json", "params", "allow_redirects", "max_redirects", "cookies",
              "compress", "chunked", "expect100", "read_until_eof", "proxy"}
 
 
-def ssl_context() -> ssl.SSLContext:
-    return ssl.create_default_context(cafile=certifi.where())
 
 
 class Utilities:
@@ -92,7 +97,7 @@ class Utilities:
             "updater/get_version_info": self.get_version_info,
             "updater/check_for_updates": self.get_version_info,
             "updater/do_restart": self.do_restart,
-            "updater/do_shutdown": self.do_restart,
+            "updater/do_shutdown": self.do_shutdown,
             "updater/do_update": self.noop,
             "updater/get_testing_versions": self.empty_list,
             "updater/download_testing_version": self.noop,
@@ -100,6 +105,8 @@ class Utilities:
             "remora/logs": self.logs,
             "remora/permissions/list": self.permissions_list,
             "remora/permissions/set": self.permissions_set,
+            "remora/permissions/confirm_mode": self.confirm_mode,
+            "remora/settings/set": self.set_remora_setting,
         }
         for name, fn in routes.items():
             ws.add_route(name, fn)
@@ -122,6 +129,20 @@ class Utilities:
         return self.settings.get(key, default)
 
     async def set_setting(self, key: str, value: Any) -> Any:
+        if not isinstance(key, str):
+            raise RouteError("TypeError", "the key must be a string")
+        if key.startswith("remora.") or key in UI_SETTINGS:
+            # root approvals, sources and the like: not through the generic route a plugin or
+            # anything driving Steam's UI can reach
+            raise RouteError("PermissionError", f"{key} can't be set with utilities/settings/set")
+        return self.settings.set(key, value)
+
+    async def set_remora_setting(self, key: str, value: Any) -> Any:
+        kind = UI_SETTINGS.get(key) if isinstance(key, str) else None
+        if kind is None:
+            raise RouteError("PermissionError", f"{key} can't be set from the UI")
+        if not isinstance(value, kind):
+            raise RouteError("TypeError", f"{key} takes a {kind.__name__}")
         return self.settings.set(key, value)
 
     async def get_user_info(self) -> dict[str, str]:
@@ -143,6 +164,8 @@ class Utilities:
             raise RouteError("KeyError", f"no plugin named {name!r}")
         log_dir = self.cfg.homebrew / "logs" / entry.info.dir_name
 
+        keep = min(max(1, int(max_lines)), 100_000)
+
         def newest() -> str:
             try:
                 files = sorted(p for p in os.listdir(log_dir) if p.endswith(".log"))
@@ -150,20 +173,38 @@ class Utilities:
                 return ""
             if not files:
                 return ""
-            from .fsutil import open_user_file_beneath
             fd = open_user_file_beneath(log_dir, [files[-1]], self.cfg.user_home)
-            with os.fdopen(fd, encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
-            return "".join(lines[-max(1, int(max_lines)):])
+            with os.fdopen(fd, "rb") as f:
+                # the tail only: read back from the end until there are enough lines
+                size = f.seek(0, os.SEEK_END)
+                pos, data = size, b""
+                while pos > 0 and data.count(b"\n") <= keep:
+                    step = min(pos, 64 * 1024)
+                    pos -= step
+                    f.seek(pos)
+                    data = f.read(step) + data
+                    if len(data) > 32 * 1024 * 1024:
+                        break
+            lines = collections.deque(data.decode("utf-8", errors="replace").splitlines(True),
+                                      maxlen=keep)
+            return "".join(lines)
 
         return await asyncio.to_thread(newest)
 
     async def permissions_list(self) -> list[dict[str, Any]]:
-        return [{"name": e.info.name, "root": True, "approved": self.manager.root_approved(e.info.name)}
+        return [{"name": e.info.name, "root": True, "approved": self.manager.root_approved(e.info.name),
+                 "source": self.manager.install_source(e.info.name)}
                 for e in self.manager.plugins.values() if e.info.root]
 
-    async def permissions_set(self, name: str, approved: bool) -> None:
-        await self.manager.set_root_permission(name, bool(approved))
+    async def permissions_set(self, name: str, approved: bool) -> dict[str, Any]:
+        """false revokes at once; true asks for physical confirmation (blocks until it's given
+        or times out) and starts the plugin when given."""
+        if not approved:
+            return await self.manager.revoke_root(name)
+        return await self.manager.request_root(name)
+
+    async def confirm_mode(self, name: str | None = None) -> dict[str, str]:
+        return self.manager.confirm_mode(name)
 
     # -- CEF ---------------------------------------------------------------------------------
 
@@ -204,8 +245,11 @@ class Utilities:
         await self._systemctl("stop", "sshd.service")
 
     async def do_restart(self) -> None:
-        # systemd starts us again (Restart=always)
-        asyncio.get_running_loop().call_later(0.5, os._exit, 0)
+        # a clean shutdown (plugins' _unload, settings flushed); systemd starts us again
+        asyncio.get_running_loop().call_later(0.5, os.kill, os.getpid(), signal.SIGTERM)
+
+    async def do_shutdown(self) -> None:
+        asyncio.get_running_loop().call_later(0.5, os.kill, os.getpid(), signal.SIGTERM)
 
     # -- HTTP --------------------------------------------------------------------------------
 
@@ -235,55 +279,37 @@ class Utilities:
                             include_folders: bool = True, include_ext: list[str] | None = None,
                             include_hidden: bool = False, order_by: str = "name_asc",
                             filter_for: str | None = None, page: int = 1, max: int = 1000) -> dict[str, Any]:
-        return await asyncio.to_thread(self._ls, path, include_files, include_folders, include_ext,
-                                       include_hidden, order_by, filter_for, page, max)
+        args = {"path": str(path) if path else str(self.cfg.user_home),
+                "include_files": include_files, "include_folders": include_folders,
+                "include_ext": include_ext, "include_hidden": include_hidden, "order_by": order_by,
+                "filter_for": filter_for, "page": page, "max_items": max}
+        if not self.cfg.running_as_root or self.cfg.uid == 0:
+            return await asyncio.to_thread(list_dir, **args)
+        # as root, list as the Game Mode user: the picker shows what the user may see, not /root
+        return await self._list_as_user(args)
 
-    def _ls(self, path: str | None, include_files: bool, include_folders: bool,
-            include_ext: list[str] | None, include_hidden: bool, order_by: str,
-            filter_for: str | None, page: int, max_items: int) -> dict[str, Any]:
-        base = Path(path) if path else self.cfg.user_home
-        real = os.path.realpath(base)
-        exts = [e.lower().lstrip(".") for e in (include_ext or ["all_files"])]
-        all_files = "all_files" in exts
-        matcher = None
-        if filter_for:
-            try:
-                rx = re.compile(filter_for)
-                matcher = lambda n: rx.search(n) is not None  # noqa: E731
-            except re.error:
-                matcher = lambda n: filter_for in n  # noqa: E731
-        files: list[dict[str, Any]] = []
-        with os.scandir(real) as it:
-            for entry in it:
-                if not include_hidden and entry.name.startswith("."):
-                    continue
-                try:
-                    st = entry.stat()
-                except OSError:
-                    continue
-                is_dir = stat.S_ISDIR(st.st_mode)
-                if is_dir and not include_folders:
-                    continue
-                if not is_dir:
-                    if not include_files:
-                        continue
-                    if not all_files and entry.name.rsplit(".", 1)[-1].lower() not in exts:
-                        continue
-                if matcher is not None and not matcher(entry.name):
-                    continue
-                files.append({"isdir": is_dir, "name": entry.name,
-                              "realpath": os.path.realpath(entry.path), "size": st.st_size,
-                              "modified": st.st_mtime, "created": getattr(st, "st_birthtime", st.st_ctime)})
-        field, _, direction = (order_by or "name_asc").partition("_")
-        key = {"name": lambda f: f["name"].lower(), "modified": lambda f: f["modified"],
-               "created": lambda f: f["created"], "size": lambda f: f["size"]}.get(field,
-                                                                                   lambda f: f["name"].lower())
-        files.sort(key=key, reverse=direction == "desc")
-        files.sort(key=lambda f: not f["isdir"])  # folders first, stable
-        page = max(1, int(page or 1))
-        max_items = max(1, int(max_items or 1000))
-        start = (page - 1) * max_items
-        return {"realpath": real, "files": files[start:start + max_items], "total": len(files)}
+    async def _list_as_user(self, args: dict[str, Any]) -> dict[str, Any]:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-P", "-s", "-m", "remora.fsutil",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE, cwd="/",
+            env={"PATH": "/usr/bin:/bin", "LANG": os.environ.get("LANG", "C.UTF-8"),
+                 "PYTHONPATH": PACKAGE_PARENT, "HOME": str(self.cfg.user_home)},
+            user=self.cfg.uid, group=self.cfg.gid,
+            extra_groups=os.getgrouplist(self.cfg.user, self.cfg.gid))
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(json.dumps(args).encode()), 30)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise RouteError("TimeoutError", "listing the folder took too long") from None
+        try:
+            answer = json.loads(out)
+        except ValueError:
+            raise RouteError("RuntimeError", f"listing failed: {err.decode(errors='replace')[-500:]}") from None
+        if not answer.get("ok"):
+            raise RouteError(str(answer.get("name") or "OSError"), str(answer.get("message") or ""))
+        return answer["value"]
 
     async def close(self) -> None:
         if self._session is not None:

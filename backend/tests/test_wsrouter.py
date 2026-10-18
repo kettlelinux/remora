@@ -252,3 +252,55 @@ async def test_close_text_and_bad_json(connect, router: WSRouter) -> None:
 def test_route_registered_twice(router: WSRouter) -> None:
     with pytest.raises(ValueError):
         router.add_route("t/add", lambda: None)  # type: ignore[arg-type,return-value]
+
+
+async def test_new_context_reusing_an_id_is_a_new_call(connect, router: WSRouter) -> None:
+    """A reloaded JS context starts its ids at 1 again: the same id with other arguments is
+    another call, not the old one's cached reply."""
+    first = await connect()
+    await first.call(1, "t/add", 1, 1)
+    assert (await first.receive())["result"] == 2  # never acked
+    await first.ws.close()
+    second = await connect()
+    await second.call(1, "t/add", 2, 2)
+    assert (await second.receive())["result"] == 4
+
+
+async def test_new_context_reusing_a_running_id_is_not_dropped(connect, router: WSRouter) -> None:
+    first = await connect()
+    await first.call(1, "t/gated")
+    await wait_for(lambda: router.counts.get("t/gated"), what="the call to start")  # type: ignore[attr-defined]
+    await first.ws.close()
+    second = await connect()
+    await second.call(1, "t/add", 3, 4)  # not "still running"
+    assert await second.receive() == {"type": MessageType.REPLY, "id": 1, "result": 7}
+    router.gate.set()  # type: ignore[attr-defined]
+    await second.nothing_for(0.3)  # the orphaned call's reply is dropped
+
+
+async def test_full_sync_orphans_running_calls_it_does_not_list(connect, router: WSRouter) -> None:
+    first = await connect()
+    await first.call(5, "t/gated")
+    await wait_for(lambda: router.counts.get("t/gated"), what="the call to start")  # type: ignore[attr-defined]
+    await first.ws.close()
+    second = await connect()
+    await second.send({"type": MessageType.FULL_SYNC, "messages": []})
+    await asyncio.sleep(0.05)
+    router.gate.set()  # type: ignore[attr-defined]
+    await second.nothing_for(0.3)
+    assert router._calls == {}
+
+
+@pytest.mark.parametrize("bad", [
+    {"type": MessageType.RECEIVED_RESPONSE, "id": [1]},
+    {"type": MessageType.CALL, "id": [1], "route": "t/add", "args": [1, 2]},
+    {"type": MessageType.CALL, "id": True, "route": "t/add", "args": [1, 2]},
+    {"type": MessageType.FULL_SYNC, "messages": {"not": "a list"}},
+    {"type": MessageType.FULL_SYNC, "messages": [{"type": 0, "id": {"x": 1}}]},
+    {"type": [1]},
+])
+async def test_malformed_messages_keep_the_connection(connect, router: WSRouter, bad) -> None:
+    peer = await connect()
+    await peer.send(bad)
+    await peer.call(1, "t/add", 1, 2)
+    assert (await peer.receive())["result"] == 3

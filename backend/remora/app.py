@@ -11,6 +11,7 @@ from aiohttp import web
 
 from .cdp import CDP, Injector
 from .config import Config
+from .confirm import ControlServer
 from .plugins.manager import PluginManager
 from .server import Server
 from .settings import Settings
@@ -36,6 +37,8 @@ class Remora:
         self.utilities.register(self.ws)
         self.store.register(self.ws)
         self.ws.add_route("remora/injector_status", self.injector_status)
+        self.control = (ControlServer(cfg.control_socket, self.manager.confirm, self.manager)
+                        if cfg.control_socket else None)
         self._runner: web.AppRunner | None = None
 
     async def injector_status(self) -> str:
@@ -52,6 +55,8 @@ class Remora:
         site = web.TCPSite(self._runner, self.cfg.host, self.cfg.port, reuse_address=True)
         await site.start()
         log.info("listening on %s:%d", self.cfg.host, self.cfg.port)
+        if self.control is not None:
+            await self.control.start()
         await self.manager.start()
         if self.cfg.inject:
             self.injector.start()
@@ -59,6 +64,8 @@ class Remora:
     async def stop(self) -> None:
         log.info("shutting down")
         await self.injector.stop()
+        if self.control is not None:
+            await self.control.close()
         await self.manager.shutdown()
         await self.store.close()
         await self.ws.close()
@@ -66,6 +73,7 @@ class Remora:
         await self.cdp.close()
         if self._runner is not None:
             await self._runner.cleanup()
+        await self.settings.flush()
 
 
 async def run(cfg: Config, show_token: bool = False) -> None:

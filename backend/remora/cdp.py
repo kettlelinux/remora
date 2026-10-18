@@ -52,7 +52,10 @@ class CDP:
     async def targets(self) -> list[Target]:
         async with self.session.get(f"{self.cfg.cef_url}/json",
                                     timeout=aiohttp.ClientTimeout(total=3)) as res:
-            return [Target.from_json(t) for t in await res.json(content_type=None)]
+            data = await res.json(content_type=None)
+        if not isinstance(data, list):
+            raise ValueError(f"devtools /json is not a list: {type(data).__name__}")
+        return [Target.from_json(t) for t in data if isinstance(t, dict)]
 
     async def target_by_title(self, title: str) -> Target:
         for target in await self.targets():
@@ -151,68 +154,122 @@ class Injector:
                 pass
 
     async def _find_target(self) -> Target:
+        last_error = ""
         while True:
             try:
                 for target in await self.cdp.targets():
                     if target.is_gamepadui:
                         return target
                 await asyncio.sleep(2)
+            except asyncio.CancelledError:
+                raise
             except (aiohttp.ClientConnectorError, ConnectionRefusedError):
                 await asyncio.sleep(5)  # Steam isn't up
-            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+                self._log_once(last_error, f"devtools: {e}")
+                last_error = f"devtools: {e}"
                 await asyncio.sleep(1)
+            except Exception as e:  # never let the injector die
+                self._log_once(last_error, f"looking for Steam's UI failed: {e!r}")
+                last_error = f"looking for Steam's UI failed: {e!r}"
+                await asyncio.sleep(2)
+
+    @staticmethod
+    def _log_once(last: str, message: str) -> None:
+        if message != last:
+            log.warning("%s", message)
+
+    def _prune(self) -> None:
+        now = time.monotonic()
+        self._crashes = [t for t in self._crashes if now - t <= self.CRASH_WINDOW]
 
     def _note_crash(self) -> int:
-        now = time.monotonic()
-        if self._crashes and now - self._crashes[-1] > self.CRASH_WINDOW:
-            self._crashes.clear()
-        self._crashes.append(now)
+        self._prune()
+        self._crashes.append(time.monotonic())
         return len(self._crashes)
 
     async def _run(self) -> None:
         while True:
-            self.status = "waiting for Steam"
-            target = await self._find_target()
             try:
-                await self._attach(target)
+                await self._run_once()
             except asyncio.CancelledError:
                 raise
-            except Exception as e:
-                log.warning("devtools connection failed: %s", e)
-            crashes = self._note_crash()
-            if crashes >= self.PAUSE_AFTER:
-                self.status = "paused after repeated Steam UI crashes"
-                log.error("Steam's UI went away %d times in a row; not injecting for 5 minutes", crashes)
-                await asyncio.sleep(300)
-                self._crashes.clear()
-            else:
-                await asyncio.sleep(1)
+            except Exception:
+                log.exception("injector failed; trying again")
+                await asyncio.sleep(2)
 
-    async def _attach(self, target: Target) -> None:
+    async def _run_once(self) -> None:
+        self.status = "waiting for Steam"
+        target = await self._find_target()
+        started = time.monotonic()
+        clean = False
+        try:
+            clean = await self._attach(target)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("devtools connection failed: %s", e)
+        if time.monotonic() - started > 60:
+            self._crashes.clear()  # it ran fine for a while: earlier losses don't count
+        if clean:
+            await asyncio.sleep(1)
+            return
+        crashes = self._note_crash()
+        if crashes >= self.PAUSE_AFTER:
+            self.status = "paused after repeated Steam UI crashes"
+            log.error("Steam's UI went away %d times in a row; not injecting for 5 minutes", crashes)
+            await asyncio.sleep(300)
+            self._crashes.clear()
+        else:
+            await asyncio.sleep(1)
+
+    async def _attach(self, target: Target) -> bool:
+        """Inject and keep the frontend injected while the connection lasts. True when devtools
+        detached cleanly (the target closed or was replaced), which is not a crash."""
         log.info("attaching to %s", target.title)
         async with self.cdp.session.ws_connect(target.ws_url, max_msg_size=0) as ws:
             cmd = 0
+            bootstraps: set[int] = set()
 
-            async def send(method: str, params: dict[str, Any] | None = None) -> None:
+            async def send(method: str, params: dict[str, Any] | None = None) -> int:
                 nonlocal cmd
                 cmd += 1
                 await ws.send_json({"id": cmd, "method": method, "params": params or {}})
+                return cmd
 
             async def inject() -> None:
+                self._prune()
                 script = "fallback.js" if len(self._crashes) >= self.FALLBACK_AFTER else "index.js"
                 self.status = "injected" if script == "index.js" else "injected the crash-loop fallback"
-                await send("Runtime.evaluate", {"expression": self.bootstrap(script), "userGesture": True})
+                bootstraps.add(await send("Runtime.evaluate",
+                                          {"expression": self.bootstrap(script), "userGesture": True}))
 
             await send("Page.enable")
             await inject()
             async for msg in ws:
                 if msg.type != aiohttp.WSMsgType.TEXT:
                     break
-                data = json.loads(msg.data)
+                try:
+                    data = json.loads(msg.data)
+                except ValueError:
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                if data.get("id") in bootstraps:
+                    bootstraps.discard(data["id"])
+                    result = data.get("result") if isinstance(data.get("result"), dict) else {}
+                    if "exceptionDetails" in result or "error" in data:
+                        self.status = "the bootstrap failed"
+                        log.error("the bootstrap failed in %s: %s", target.title,
+                                  json.dumps(result.get("exceptionDetails") or data.get("error"))[:2000])
+                    continue
                 method = data.get("method")
                 if method == "Page.domContentEventFired":
                     # Steam reloaded the context; the bootstrap's guard is gone with it
                     await inject()
                 elif method == "Inspector.detached":
-                    log.info("devtools detached")
-                    return
+                    params = data.get("params") if isinstance(data.get("params"), dict) else {}
+                    reason = str(params.get("reason", ""))
+                    log.info("devtools detached (%s)", reason or "no reason given")
+                    return "crash" not in reason.lower() and "gone" not in reason.lower()
+        return False

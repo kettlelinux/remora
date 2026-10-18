@@ -204,3 +204,28 @@ def test_makedirs_as_user_really_chowns(tmp_path: Path) -> None:
     home.mkdir()
     makedirs_as_user(home / "a" / "b", home, 1234, 1234)
     assert (home / "a").stat().st_uid == 1234 and (home / "a" / "b").stat().st_gid == 1234
+
+
+def test_file_picker_worker(tmp_path: Path) -> None:
+    """The file picker's worker, which the loader runs as the Game Mode user when it is root."""
+    import json
+    import subprocess
+    import sys
+
+    from conftest import BACKEND
+
+    (tmp_path / "b.txt").write_text("x")
+    (tmp_path / "a").mkdir()
+    (tmp_path / ".hidden").write_text("x")
+    args = {"path": str(tmp_path), "include_ext": ["txt"]}
+    res = subprocess.run([sys.executable, "-P", "-s", "-m", "remora.fsutil"], input=json.dumps(args),
+                         capture_output=True, text=True, timeout=30,
+                         env={"PYTHONPATH": str(BACKEND), "PATH": "/usr/bin"})
+    answer = json.loads(res.stdout)
+    assert answer["ok"] and [f["name"] for f in answer["value"]["files"]] == ["a", "b.txt"]
+    res = subprocess.run([sys.executable, "-P", "-s", "-m", "remora.fsutil"],
+                         input=json.dumps({"path": str(tmp_path / "missing")}),
+                         capture_output=True, text=True, timeout=30,
+                         env={"PYTHONPATH": str(BACKEND), "PATH": "/usr/bin"})
+    answer = json.loads(res.stdout)
+    assert answer == {"ok": False, "name": "FileNotFoundError", "message": answer["message"]}

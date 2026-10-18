@@ -29,10 +29,16 @@ mimetypes.add_type("application/javascript", ".js")
 mimetypes.add_type("application/javascript", ".mjs")
 
 # routes anyone may fetch without the token (by route name, not by matching URL strings)
-OPEN_ROUTES = {"auth_token", "frontend", "static", "plugin_dist", "plugin_assets", "plugin_data",
+OPEN_ROUTES = {"frontend", "static", "plugin_dist", "plugin_assets", "plugin_data",
                "ws", "fetch", "locales"}
 
 Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
+
+
+def _inside(path: str, folder: str) -> bool:
+    """Does path, links resolved, stay inside folder (itself resolved)?"""
+    real, top = os.path.realpath(path), os.path.realpath(folder)
+    return real == top or real.startswith(top.rstrip("/") + "/")
 
 
 def _route_name(request: web.Request) -> str | None:
@@ -101,11 +107,27 @@ class Server:
 
     # -- app ---------------------------------------------------------------------------------
 
+    def check_layout(self) -> None:
+        """Running as root with plugins/ the user can write: the user could plant plugins (and
+        dist/ links). Remora refuses the links it can see, but say so loudly."""
+        if not self.cfg.running_as_root:
+            return
+        try:
+            st = os.stat(self.cfg.plugins_dir)
+        except OSError:
+            return
+        if st.st_uid != 0 or st.st_mode & 0o022:
+            log.warning("%s is writable by someone other than root (owner uid %d, mode %o): "
+                        "anyone who can write there can run code as the loader's plugins",
+                        self.cfg.plugins_dir, st.st_uid, st.st_mode & 0o7777)
+
     def app(self) -> web.Application:
+        self.check_layout()
         app = web.Application(middlewares=[self.host_check, self.cors, self.auth],
                               client_max_size=256 * 1024 * 1024)
         r = app.router
-        r.add_get("/auth/token", self.auth_token, name="auth_token")
+        # no /auth/token: the token reaches Steam's JS context only through the CDP bootstrap.
+        # Anything that can set an Origin header could ask for it (compat/backend.md W1).
         r.add_get("/ws", self.websocket, name="ws")
         r.add_route("*", "/fetch", self.fetch, name="fetch")
         r.add_get("/frontend/{path:.*}", self.frontend, name="frontend")
@@ -125,13 +147,6 @@ class Server:
 
     # -- handlers ----------------------------------------------------------------------------
 
-    async def auth_token(self, request: web.Request) -> web.Response:
-        # the injected frontend gets the token from the CDP bootstrap; this is for code in
-        # Steam's pages that still asks for it the Decky way (compat/backend.md W1)
-        if request.headers.get("Origin") != STEAM_ORIGIN:
-            raise web.HTTPForbidden(text="Forbidden")
-        return web.Response(text=self.token)
-
     async def websocket(self, request: web.Request) -> web.StreamResponse:
         if request.query.get("auth") != self.token:
             raise web.HTTPForbidden(text="Forbidden")
@@ -149,17 +164,24 @@ class Server:
                 self._cors_headers(response, origin)
             await response.prepare(request)
             if request.method != "HEAD":
-                while True:
-                    chunk = await asyncio.to_thread(f.read, 256 * 1024)
+                left = size  # what Content-Length promised, even if the file grows meanwhile
+                while left > 0:
+                    chunk = await asyncio.to_thread(f.read, min(left, 256 * 1024))
                     if not chunk:
                         break
+                    left -= len(chunk)
                     await response.write(chunk)
             await response.write_eof()
             return response
 
     async def _serve(self, request: web.Request, base: str, rel: str,
-                     user_base: Path | None = None) -> web.StreamResponse:
+                     user_base: Path | None = None, within: str | None = None) -> web.StreamResponse:
+        """A file below base. `within`: base must resolve inside that folder (a plugin's dist/
+        that is a link out of the plugin, to /, is refused)."""
         try:
+            if within is not None and not _inside(base, within):
+                log.warning("refused %s: it leads out of %s", base, within)
+                raise UnsafePath(base)
             parts = split_relative(rel)
             if user_base is not None:
                 fd = open_user_file_beneath(user_base, parts, self.cfg.user_home)
@@ -189,13 +211,15 @@ class Server:
 
     async def plugin_dist(self, request: web.Request) -> web.StreamResponse:
         info = self._plugin(request)
-        return await self._serve(request, os.path.join(os.path.realpath(info.path), "dist"),
-                                 request.match_info["path"])
+        root = os.path.realpath(info.path)
+        return await self._serve(request, os.path.join(root, "dist"), request.match_info["path"],
+                                 within=root)
 
     async def plugin_assets(self, request: web.Request) -> web.StreamResponse:
         info = self._plugin(request)
-        return await self._serve(request, os.path.join(os.path.realpath(info.path), "dist", "assets"),
-                                 request.match_info["path"])
+        root = os.path.realpath(info.path)
+        return await self._serve(request, os.path.join(root, "dist", "assets"),
+                                 request.match_info["path"], within=root)
 
     async def plugin_data(self, request: web.Request) -> web.StreamResponse:
         info = self._plugin(request)
@@ -204,8 +228,12 @@ class Server:
 
     async def frontend_bundle(self, request: web.Request) -> web.StreamResponse:
         info = self._plugin(request)
+        root = os.path.realpath(info.path)
+        dist = os.path.join(root, "dist")
         try:
-            fd = open_beneath(os.path.join(os.path.realpath(info.path), "dist"), ["index.js"])
+            if not _inside(dist, root):
+                raise UnsafePath(dist)
+            fd = open_beneath(dist, ["index.js"])
         except OSError:
             raise web.HTTPNotFound() from None
         return await self._send_fd(request, fd, "index.js", "application/javascript")

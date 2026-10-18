@@ -21,6 +21,10 @@ from typing import Any
 LINE_LIMIT = 64 * 1024 * 1024
 
 
+def encode(message: dict[str, Any]) -> bytes:
+    return json.dumps(message, ensure_ascii=False).encode() + b"\n"
+
+
 class Channel:
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         self.reader = reader
@@ -33,7 +37,10 @@ class Channel:
         return cls(reader, writer)
 
     async def send(self, message: dict[str, Any]) -> None:
-        data = json.dumps(message, ensure_ascii=False).encode() + b"\n"
+        await self.send_encoded(encode(message))
+
+    async def send_encoded(self, data: bytes) -> None:
+        """Send a message already encoded with encode() (big results are serialized once)."""
         async with self._lock:
             self.writer.write(data)
             await self.writer.drain()

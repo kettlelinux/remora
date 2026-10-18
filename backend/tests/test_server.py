@@ -74,12 +74,12 @@ async def test_localhost_host_is_fine(client: TestClient, cfg: Config) -> None:
     assert res.status == 200
 
 
-async def test_auth_token_needs_steam_origin(client: TestClient) -> None:
-    assert (await client.get("/auth/token")).status == 403
-    assert (await client.get("/auth/token", headers={"Origin": "https://evil.example"})).status == 403
-    res = await client.get("/auth/token", headers={"Origin": STEAM_ORIGIN})
-    assert res.status == 200 and await res.text() == TOKEN
-    assert res.headers["Access-Control-Allow-Origin"] == STEAM_ORIGIN
+async def test_no_auth_token_route(client: TestClient) -> None:
+    """The token comes only from the CDP bootstrap: an Origin header anyone can set gets nothing."""
+    for headers in ({}, {"Origin": "https://evil.example"}, {"Origin": STEAM_ORIGIN}):
+        res = await client.get("/auth/token", headers=headers)
+        assert res.status in (403, 404)
+        assert TOKEN not in await res.text()
 
 
 async def test_protected_routes_need_the_header(client: TestClient) -> None:
@@ -300,3 +300,95 @@ async def test_fifo_in_data_folder_is_refused(client: TestClient, cfg: Config) -
 
     res = await asyncio.wait_for(client.get("/plugins/My%20Plugin/data/fifo"), 3)
     assert res.status == 404
+
+
+async def test_dist_linked_out_of_the_plugin_is_refused(cfg: Config, settings, ws, make_plugin,
+                                                         tmp_path) -> None:
+    """plugins/x/dist -> / would serve /etc/shadow as root, without a token."""
+    outside = tmp_path / "elsewhere"
+    (outside / "assets").mkdir(parents=True)
+    (outside / "index.js").write_text("outside")
+    (outside / "assets" / "a.txt").write_text("outside")
+    path = make_plugin("linked", "Linked", None)
+    os.symlink(outside, path / "dist")
+    manager = PluginManager(cfg, settings, ws)
+    manager._register(manifest.read_plugin(path))
+    cdp = CDP(cfg)
+    utilities = Utilities(cfg, settings, manager, cdp, ws)
+    server = Server(cfg, TOKEN, ws, manager, utilities)
+    async with TestClient(TestServer(server.app(), host="127.0.0.1", port=cfg.port)) as c:
+        for url in ("/plugins/Linked/dist/index.js", "/plugins/Linked/assets/a.txt"):
+            res = await c.get(url)
+            assert res.status == 404 and "outside" not in await res.text(), url
+        res = await c.get("/plugins/Linked/frontend_bundle", headers=AUTH)
+        assert res.status == 404
+    await utilities.close()
+    await cdp.close()
+
+
+async def test_file_growing_while_sent_stops_at_content_length(cfg: Config, settings, ws,
+                                                               plugin_dirs, client: TestClient,
+                                                               monkeypatch) -> None:
+    import remora.server as server_mod
+
+    real_fstat = os.fstat
+    target = plugin_dirs / "dist" / "sub" / "chunk.js"
+
+    seen = []
+
+    def fstat(fd):  # the file grows after Content-Length was taken (the second fstat)
+        st = real_fstat(fd)
+        if os.path.samestat(st, os.stat(target)):
+            seen.append(fd)
+            if len(seen) == 2:
+                with open(target, "a") as f:
+                    f.write("MORE")
+        return st
+
+    monkeypatch.setattr(server_mod.os, "fstat", fstat)
+    res = await client.get("/plugins/My%20Plugin/dist/sub/chunk.js")
+    assert res.status == 200 and await res.text() == "chunk"
+
+
+async def test_settings_set_refuses_remora_keys(client: TestClient, settings) -> None:
+    res = await client.post("/methods/set_setting", headers=AUTH,
+                            json={"key": "remora.rootApproved", "value": ["Evil"]})
+    body = await res.json()
+    assert body["success"] is False and "remora.rootApproved" in body["result"]
+    assert settings.get("remora.rootApproved") is None
+    res = await client.post("/methods/set_setting", headers=AUTH, json={"key": "plain", "value": 1})
+    assert (await res.json())["success"] is True
+
+
+async def test_settings_routes(cfg: Config, settings, ws) -> None:
+    from remora.wsrouter import RouteError
+
+    manager = PluginManager(cfg, settings, ws)
+    utilities = Utilities(cfg, settings, manager, CDP(cfg), ws)
+    for key in ("remora.rootApproved", "remora.rootMigrated", "remora.installSource",
+                "remora.storeSources", "remora.anything"):
+        with pytest.raises(RouteError) as e:
+            await utilities.set_setting(key, True)
+        assert e.value.name == "PermissionError"
+        with pytest.raises(RouteError):
+            await utilities.set_remora_setting(key, True)
+    assert await utilities.set_remora_setting("remora.storeTelemetry", True) is True
+    assert await utilities.set_remora_setting("remora.verbose", False) is False
+    with pytest.raises(RouteError):
+        await utilities.set_remora_setting("remora.verbose", "yes")
+    assert settings.get("remora.storeTelemetry") is True
+    await utilities.close()
+
+
+async def test_logs_route_tails(cfg: Config, settings, ws, plugin_dirs) -> None:
+    manager = PluginManager(cfg, settings, ws)
+    manager._register(manifest.read_plugin(plugin_dirs))
+    utilities = Utilities(cfg, settings, manager, CDP(cfg), ws)
+    logs = cfg.homebrew / "logs" / "my-plugin"
+    logs.mkdir(parents=True)
+    (logs / "2020.log").write_text("old\n")
+    (logs / "2021.log").write_text("".join(f"line {i}\n" for i in range(200_000)))
+    text = await utilities.logs("My Plugin", 3)
+    assert text == "line 199997\nline 199998\nline 199999\n"
+    assert (await utilities.logs("My Plugin")).count("\n") == 500
+    await utilities.close()

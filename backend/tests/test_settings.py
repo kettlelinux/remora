@@ -54,10 +54,10 @@ def test_failed_write_leaves_the_old_file(tmp_path: Path, monkeypatch: pytest.Mo
     s = Settings(path)
     s.set("a", 1)
 
-    def broken_dump(*args, **kwargs):
+    def broken_fsync(*args, **kwargs):
         raise OSError("disk full")
 
-    monkeypatch.setattr(settings_mod.json, "dump", broken_dump)
+    monkeypatch.setattr(settings_mod.os, "fsync", broken_fsync)
     with pytest.raises(OSError):
         s.set("b", 2)
     assert json.loads(path.read_text()) == {"a": 1}
@@ -149,3 +149,34 @@ def test_settings_manager_broken_file(legacy_settings, tmp_path: Path) -> None:
     assert sm.settings == {}
     sm.setSetting("ok", 1)
     assert json.loads((tmp_path / "s" / "x.json").read_text()) == {"ok": 1}
+
+
+async def test_writes_off_the_loop_keep_order(tmp_path: Path) -> None:
+    """In the loader (a running loop) writes go to a thread, coalesced, newest state last."""
+    path = tmp_path / "loader.json"
+    s = Settings(path)
+    for i in range(50):
+        s.set("n", i)
+    s.set("other", "x")
+    assert s.get("n") == 49  # memory is current at once
+    await s.flush()
+    assert json.loads(path.read_text()) == {"n": 49, "other": "x"}
+    assert leftovers(tmp_path) == []
+
+
+async def test_unserializable_value_raises_in_the_loop_too(tmp_path: Path) -> None:
+    s = Settings(tmp_path / "loader.json")
+    s.set("a", 1)
+    with pytest.raises(TypeError):
+        s.set("bad", object())
+    assert "bad" not in s.data
+    await s.flush()
+    assert json.loads((tmp_path / "loader.json").read_text()) == {"a": 1}
+
+
+def test_list_remove_drops_named_entries(tmp_path: Path) -> None:
+    s = Settings(tmp_path / "loader.json")
+    s.set("remora.rootApproved", ["A", {"name": "B", "source": None}, {"name": "C", "source": "x"}])
+    s.list_remove("remora.rootApproved", "B")
+    s.list_remove("remora.rootApproved", "A")
+    assert s.get("remora.rootApproved") == [{"name": "C", "source": "x"}]
